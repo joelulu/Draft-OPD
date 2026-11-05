@@ -140,3 +140,7 @@ If you find our work useful, please consider citing our paper:
       url={https://arxiv.org/abs/2605.29343}, 
 }
 ```
+
+## Adaptive draft length (Qwen3-4B research)
+
+Pre-draft pivot + anchor length head, paired real-width labels, multi-length OPD reference training and greedy evaluation: [guide](diffusion/dflash/adaptive_length/README.md).

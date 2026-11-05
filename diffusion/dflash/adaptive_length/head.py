@@ -35,12 +35,14 @@ class LengthHead(nn.Module):
 
     def loss(self, pivot, anchor, accepted):
         # Equal weight per action; the target is realized greedy prefix acceptance.
-        return F.smooth_l1_loss(self(pivot, anchor), accepted.float())
+        return F.mse_loss(self(pivot, anchor), accepted.float())
 
 
 def select_lengths(expected_acceptance, costs_ms, lengths, remaining=None):
     """Return action indices. Only select widths that fit the remaining output budget."""
     costs = torch.as_tensor(costs_ms, device=expected_acceptance.device, dtype=torch.float32)
+    if costs.ndim != 1 or costs.numel() != len(lengths) or expected_acceptance.shape[-1] != len(lengths):
+        raise ValueError("Expected one prediction and one cost per candidate length.")
     if not torch.isfinite(costs).all() or (costs <= 0).any():
         raise ValueError("Every action needs a finite positive draft+verify cost.")
     scores = (expected_acceptance + 1) / costs

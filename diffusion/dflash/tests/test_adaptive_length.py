@@ -84,6 +84,7 @@ def test_paired_runtime_and_variable_steps_match_greedy(all_accepted):
         runtime.verify(repeated)
         for a, b in zip(original, runtime.features()):
             torch.testing.assert_close(a, b)
+        runtime.advance(first, result)  # paired collection restores committed target KV
         for k in [4, 8, 2, 4]:
             runtime.step(k)
         # Greedy reference is recomputed without a cache to catch position/cache errors.
@@ -96,26 +97,72 @@ def test_paired_runtime_and_variable_steps_match_greedy(all_accepted):
         torch.testing.assert_close(runtime.prefix[:, -1:], target(expected).logits[:, -1:].argmax(-1))
 
 
-def test_training_cli_groups_duplicate_prompts_and_saves_costs(tmp_path):
-    import json
-    from adaptive_length.cli import train, load
+def test_opd_loss_has_student_gradients_only():
+    from adaptive_length.pipeline import opd_loss
+    student = torch.randn(1, 4, 7, requires_grad=True)
+    teacher = torch.randn(1, 4, 7, requires_grad=True)
+    loss = opd_loss(student, teacher, accepted=2)
+    loss.backward()
+    assert torch.isfinite(student.grad).all()
+    assert (student.grad.abs().sum(-1) > 0).all()
+    assert teacher.grad is None
+
+
+def test_head_pipeline_groups_prompts_and_saves_costs(tmp_path):
+    from adaptive_length.pipeline import train_head, split_rows
     source = tmp_path / "paired"
     source.mkdir()
-    (source / "metadata.json").write_text(json.dumps(dict(hidden_size=8, lengths=[4, 8])))
-    manifest = []
-    for index, prompt_id in enumerate(["same", "same", "other", "third", "fourth"]):
-        row = dict(pivot=torch.randn(8), anchor=torch.randn(8), accepted=torch.tensor([2, 3]),
-                   draft_ms=torch.tensor([1., 2.]), verify_ms=torch.tensor([2., 4.]))
-        name = f"prompt_{index}.pt"
-        torch.save(dict(prompt_id=prompt_id, rows=[row]), source / name)
-        manifest.append(dict(file=name, prompt_id=prompt_id, states=1))
-    (source / "manifest.json").write_text(json.dumps(manifest))
+    # All duplicate occurrences of a content hash must stay in one group.
+    keys = ["00000001", "00000001", "00000002", "00000005", "0000000a"]
+    torch.save(dict(pivot=torch.randn(5, 8), anchor=torch.randn(5, 8),
+                    accepted=torch.tensor([[2., 3.]]).repeat(5, 1),
+                    costs_ms=torch.tensor([[3., 6.]]).repeat(5, 1),
+                    prompt_keys=keys, metadata=dict(lengths=[4,8])), source / "labels_rank000.pt")
     output = tmp_path / "head.pt"
-    args = SimpleNamespace(seed=42, input=str(source), output=str(output), val_fraction=0.25,
-                           device="cpu", features="both", lr=0.001, epochs=2, batch_size=4)
-    train(args)
-    saved = load(output)
-    assert not set(saved["train_prompt_ids"]) & set(saved["val_prompt_ids"])
-    assert set(saved["train_prompt_ids"] + saved["val_prompt_ids"]) == {"same", "other", "third", "fourth"}
-    assert saved["fixed_k"] == 4
+    args = SimpleNamespace(seed=42, labels=str(source), output=str(output), costs=None,
+                           device="cpu", features="both", projection=8,
+                           lr=0.001, epochs=2, batch_size=4)
+    train_head(args)
+    saved = torch.load(output, weights_only=True)
+    assert saved["used_prompt_keys"] == sorted(set(keys))
+    assert saved["validation"]["train_anchors"] == 3
+    assert saved["validation"]["val_anchors"] == 2
     torch.testing.assert_close(saved["costs_ms"], torch.tensor([3., 6.]))
+    rows = [(key, []) for key in keys]
+    assert not set(k for k, _ in split_rows(rows, "train")) & set(k for k, _ in split_rows(rows, "val"))
+
+
+def test_real_draft_training_backward_and_fresh_cache():
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    from model.dflash import DFlashDraftModel
+    from adaptive_length.runtime import RoundRuntime
+    from adaptive_length.pipeline import opd_loss
+    torch.manual_seed(33)
+    config = Qwen3Config(vocab_size=31, hidden_size=16, intermediate_size=32,
+                        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                        head_dim=8, max_position_embeddings=128, attn_implementation="sdpa")
+    target = Qwen3ForCausalLM(config).eval().requires_grad_(False)
+    dc = Qwen3Config(**config.to_dict())
+    dc.num_hidden_layers = 1
+    dc.num_target_layers = 2
+    dc.block_size = 5
+    dc.layer_types = ["full_attention"]
+    dc.dflash_config = dict(target_layer_ids=[0], mask_token_id=30)
+    dc._attn_implementation = "sdpa"
+    draft = DFlashDraftModel(dc)
+    opt = torch.optim.AdamW(draft.parameters(), lr=1e-3)
+    prefix = torch.tensor([[1, 2, 3]])
+    for k in [4, 8]:
+        runtime = RoundRuntime(target, draft, prefix)
+        block, logits = runtime.propose(k, return_logits=True)
+        result, teacher_logits = runtime.verify(block, keep_cache=True, return_logits=True)
+        loss = opd_loss(logits, teacher_logits, result[0])
+        opt.zero_grad()
+        loss.backward()
+        assert draft.fc.weight.grad is not None
+        assert torch.isfinite(draft.fc.weight.grad).all()
+        assert all(p.grad is None for p in target.parameters())
+        opt.step()
+        with torch.no_grad():
+            runtime.advance(block, result, cache_kept=True)
+            prefix = runtime.prefix.detach()

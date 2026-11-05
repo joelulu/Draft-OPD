@@ -26,3 +26,11 @@
 # Local experiment notes and one-off conversion wrappers contain machine paths.
 /verl/change-by-codex.md
 /verl/my-purpose.md
+
+# Reusable adaptive-length experiment entrypoints and regression checks.
+!/scripts/
+/scripts/*
+!/scripts/adaptive_length/
+**/__pycache__/
+*.pyc
+/runs/
