@@ -18,16 +18,27 @@ _index_first_axis, _pad_input, _rearrange, _unpad_input = None, None, None, None
 
 
 def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
-    """Dynamically import attention functions based on available hardware."""
+    """Select padding helpers; FlashAttention is optional for these tensor ops."""
 
     from verl.utils.device import is_torch_npu_available
 
     global _index_first_axis, _pad_input, _rearrange, _unpad_input
 
+    if all(func is not None for func in (_index_first_axis, _pad_input, _rearrange, _unpad_input)):
+        return _index_first_axis, _pad_input, _rearrange, _unpad_input
+
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"flash_attn", "flash_attn.bert_padding"}:
+                raise
+            # These existing helpers use only torch/einops, with no NPU kernels.
+            # Keep SDPA training independent of the optional flash_attn package.
+            # Do not hide broken installed backends or missing transitive deps.
+            from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 
@@ -44,7 +55,8 @@ def index_first_axis(*args, **kwargs):
         (falls back to `transformers.modeling_flash_attention_utils._index_first_axis`
         in newer versions of transformers).
 
-    Users can call this function directly without worrying about the underlying device.
+    Without flash_attn, the existing pure PyTorch/einops helpers are used.
+    This fallback implements padding/indexing, not FlashAttention kernels.
     """
     func, *_ = _get_attention_functions()
     return func(*args, **kwargs)
@@ -60,7 +72,8 @@ def pad_input(*args, **kwargs):
         (falls back to `transformers.modeling_flash_attention_utils._pad_input`
         in newer versions of transformers).
 
-    Users can call this function directly without worrying about the underlying device.
+    Without flash_attn, the existing pure PyTorch/einops helpers are used.
+    This fallback implements padding/indexing, not FlashAttention kernels.
     """
     _, func, *_ = _get_attention_functions()
     return func(*args, **kwargs)
@@ -75,7 +88,8 @@ def rearrange(*args, **kwargs):
       - On NPU: `transformers.integrations.npu_flash_attention.rearrange`
         (falls back to `einops.rearrange` if no dedicated NPU implementation exists).
 
-    Users can call this function directly without worrying about the underlying device.
+    Without flash_attn, the existing pure PyTorch/einops helpers are used.
+    This fallback implements padding/indexing, not FlashAttention kernels.
     """
     *_, func, _ = _get_attention_functions()
     return func(*args, **kwargs)
@@ -91,7 +105,8 @@ def unpad_input(*args, **kwargs):
         (falls back to `transformers.modeling_flash_attention_utils._unpad_input`
         in newer versions of transformers).
 
-    Users can call this function directly without worrying about the underlying device.
+    Without flash_attn, the existing pure PyTorch/einops helpers are used.
+    This fallback implements padding/indexing, not FlashAttention kernels.
     """
     *_, func = _get_attention_functions()
     return func(*args, **kwargs)

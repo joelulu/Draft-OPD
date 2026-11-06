@@ -63,6 +63,14 @@ path = inspect.getfile(ComposedDFlashStudentForCausalLM)
 if not hasattr(ComposedDFlashStudentForCausalLM, '_get_response_train_block_size'):
     raise RuntimeError(f'Loaded an older verl checkout: {path}')
 print(f'Using native OPD student: {path}')
+import torch
+from verl.utils.attention_utils import unpad_input, pad_input
+x = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
+mask = torch.tensor([[0, 1, 1]])
+values, indices, *_ = unpad_input(x, mask)
+restored = pad_input(values, indices, 1, 3)
+assert torch.equal(restored[:, 1:], x[:, 1:])
+print('Padding preflight passed (flash_attn is optional for padding helpers).')
 PY
 mkdir -p "$CKPT_DIR"
 printf 'arm=%s\nresponse_train_lengths=%s\nrollout_and_rejected_replay=native\ncheckpoint=%s\n' \

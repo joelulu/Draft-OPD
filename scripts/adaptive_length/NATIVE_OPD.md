@@ -91,3 +91,15 @@ K=4/12/32 input widths, native rejection replay (including an offset beyond samp
 K), unchanged response mask and teacher labels, draft-only gradients, native-only
 numerical equivalence, eval/no-grad behavior and unsupported TV guards. They do
 not launch Ray/FSDP/SGLang or validate GPU memory/runtime; server smoke is required.
+
+## SDPA padding without the flash_attn package
+
+The generic padding dispatcher now uses the repository's existing pure
+PyTorch/einops padding helpers when `flash_attn.bert_padding` is absent. Native
+FlashAttention helpers remain preferred when available; unrelated import errors
+are not suppressed. This only removes an unnecessary dependency for
+index/pad/unpad operations. It does not emulate FlashAttention kernels.
+The native launcher runs a tiny padding roundtrip before initializing Ray/models,
+so this dependency path is checked before an expensive multi-GPU startup.
+
+Regression tests: `python -m pytest -q diffusion/dflash/tests/test_attention_padding_fallback.py`.
