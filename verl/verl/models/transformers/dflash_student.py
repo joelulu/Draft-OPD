@@ -345,6 +345,28 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             raise ValueError("DFLASH OPD requires draft_model.block_size or draft_model.config.block_size.")
         return int(block_size)
 
+    def _get_train_candidate_lengths(self) -> tuple[int, ...]:
+        """Optional response-stream widths; native rollout/rejection replay stays fixed."""
+        value = getattr(self.config, "verl_dflash_train_candidate_lengths", None)
+        if value is None:
+            value = os.getenv("VERL_DFLASH_TRAIN_CANDIDATE_LENGTHS", "")
+        if isinstance(value, str):
+            value = value.strip().strip("[]").replace(",", " ").split()
+        if value is None:
+            return ()
+        lengths = tuple(int(k) for k in value)
+        if lengths and (lengths != tuple(sorted(set(lengths))) or any(k < 1 or k > 32 for k in lengths)):
+            raise ValueError("verl_dflash_train_candidate_lengths must be unique increasing candidate counts in [1,32].")
+        return lengths
+
+    def _get_response_train_block_size(self) -> int:
+        lengths = self._get_train_candidate_lengths()
+        if not lengths or not self.training or not torch.is_grad_enabled():
+            return self._get_block_size()
+        # Sample exactly once per composed forward. Checkpoint recomputation only
+        # encloses _run_dflash_draft_forward, so it never resamples the width.
+        return lengths[int(torch.randint(len(lengths), ()).item())] + 1
+
     def _get_lm_head_chunk_size(self) -> int:
         chunk_size = getattr(self.config, "verl_dflash_lm_head_chunk_size", None)
         if chunk_size is None:
@@ -729,6 +751,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         rejected_draft_offsets: Optional[torch.LongTensor] = None,
         rejected_draft_mask: Optional[torch.Tensor] = None,
         include_rejected_draft_anchors: bool = True,
+        response_segment_limit: Optional[int] = None,
+        tile_response_segments: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -788,11 +812,22 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 segment_len = boundary_resp - anchor_resp
                 if segment_len <= 0:
                     continue
-                segment_len = min(segment_len, draft_block_size - 1)
+                segment_len = min(segment_len, response_segment_limit or (draft_block_size - 1))
                 if full_anchor < 0 or full_anchor >= seq_len - 1:
                     continue
-                response_anchors_resp.append(anchor_resp)
-                response_segment_lens.append(segment_len)
+                if tile_response_segments:
+                    # Preserve the original supervised response positions. Short K
+                    # partitions a native accepted segment rather than dropping its
+                    # tail; large K does not invent additional acceptance labels.
+                    consumed = 0
+                    while consumed < segment_len:
+                        chunk = min(draft_block_size - 1, segment_len - consumed)
+                        response_anchors_resp.append(anchor_resp + consumed)
+                        response_segment_lens.append(chunk)
+                        consumed += chunk
+                else:
+                    response_anchors_resp.append(anchor_resp)
+                    response_segment_lens.append(segment_len)
 
             if random_response_anchor_enabled and response_len > 0 and response_segment_lens:
                 response_anchors_resp, response_segment_lens = self._build_random_response_anchor_plan(
@@ -1691,6 +1726,13 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         if input_ids.dim() != 2:
             raise ValueError(f"DFLASH OPD requires padded 2D input_ids, got shape={tuple(input_ids.shape)}.")
 
+        train_lengths = self._get_train_candidate_lengths()
+        if use_tv_loss and train_lengths:
+            raise NotImplementedError("Mixed response widths currently support scalar OPD only, not TV mode.")
+        mixed_response_training = bool(train_lengths) and self.training and torch.is_grad_enabled()
+        native_block_size = self._get_block_size()
+        response_block_size = self._get_response_train_block_size()
+
         profile_enabled = self._is_dflash_profiling_enabled()
         self._maybe_sync_for_profile(profile_enabled, input_ids.device)
         total_start_time = time.perf_counter()
@@ -1758,13 +1800,16 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
 
         # SGLang DFLASH uses block_size as the total block length: one anchor
         # token plus block_size - 1 future-token predictions.
-        draft_block_size = self._get_block_size()
+        draft_block_size = response_block_size
         lm_head_chunk_size = self._get_lm_head_chunk_size()
         response_anchor_stride = self._get_response_anchor_stride()
         random_response_anchor_enabled = self._get_random_response_anchor_enabled()
         random_response_anchor_seed = self._get_random_response_anchor_seed()
         rejected_draft_max_tokens_per_sample = self._get_rejected_draft_max_tokens_per_sample()
-        split_random_rejected_pass = random_response_anchor_enabled
+        # A short mixed response width must NEVER truncate native rejected offsets.
+        # Even when random anchors are disabled, replay rejected proposals in a
+        # separate native-width pass using their original teacher feedback.
+        split_random_rejected_pass = random_response_anchor_enabled or mixed_response_training
         anchor_positions, segment_lens, row_starts, block_keep_mask, valid_seq_lens, opd_metrics = (
             self._build_opd_anchor_plan(
                 input_ids=input_ids,
@@ -1780,6 +1825,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 rejected_draft_offsets=rejected_draft_offsets,
                 rejected_draft_mask=rejected_draft_mask,
                 include_rejected_draft_anchors=not split_random_rejected_pass,
+                response_segment_limit=(native_block_size - 1) if mixed_response_training else None,
+                tile_response_segments=mixed_response_training,
             )
         )
 
@@ -1805,7 +1852,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 input_ids=input_ids,
                 prompt_lengths=prompt_lengths,
                 response_lengths=response_lengths,
-                draft_block_size=draft_block_size,
+                draft_block_size=native_block_size,
                 max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
                 rejected_draft_anchor_indices=rejected_draft_anchor_indices,
                 rejected_draft_offsets=rejected_draft_offsets,
@@ -1826,7 +1873,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             max_blocks_per_sample = (block_keep_mask.sum(dim=1) + rejected_block_keep_mask.sum(dim=1)).max().to(
                 dtype=torch.float32
             )
-        draft_q_token_count = padded_block_count * draft_block_size
+        draft_q_token_count = (response_padded_block_count * response_block_size
+                               + rejected_padded_block_count * native_block_size)
 
         output_embeddings = self.get_output_embeddings()
         if output_embeddings is None:
@@ -1959,7 +2007,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 target_hidden=target_hidden,
                 anchor_positions=rejected_anchor_positions,
                 block_keep_mask=rejected_block_keep_mask,
-                draft_block_size=draft_block_size,
+                draft_block_size=native_block_size,
                 profile_enabled=profile_enabled,
                 checkpoint_forward=True,
             )
@@ -1974,7 +2022,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     response_lengths=response_lengths,
                     anchor_positions=rejected_anchor_positions,
                     block_keep_mask=rejected_block_keep_mask,
-                    draft_block_size=draft_block_size,
+                    draft_block_size=native_block_size,
                     lm_head_chunk_size=lm_head_chunk_size,
                     max_tokens_per_sample=rejected_draft_max_tokens_per_sample,
                     rejected_draft_anchor_indices=rejected_draft_anchor_indices,
@@ -2034,6 +2082,12 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 DFLASH_ATTENTION_IMPL_IDS.get(attn_impl, -1)
             ),
         }
+        output["dflash_opd_train_response_candidates"] = log_probs_by_seq.new_tensor(response_block_size - 1)
+        output["dflash_opd_native_replay_candidates"] = log_probs_by_seq.new_tensor(native_block_size - 1)
+        output["dflash_opd_mixed_response_training"] = log_probs_by_seq.new_tensor(float(mixed_response_training))
+        for k in train_lengths:
+            output[f"dflash_opd_train_width_{k}_fraction"] = log_probs_by_seq.new_tensor(
+                float(mixed_response_training and response_block_size == k + 1))
         if profile_enabled:
             output.update(
                 {
@@ -2063,7 +2117,7 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                     replay_block_accepted_lengths=replay_block_accepted_lengths,
                     replay_block_drafted_lengths=replay_block_drafted_lengths,
                     replay_block_mask=replay_block_mask,
-                    draft_block_size=draft_block_size,
+                    draft_block_size=native_block_size,
                     lm_head_chunk_size=lm_head_chunk_size,
                     profile_enabled=profile_enabled,
                 )

@@ -189,3 +189,11 @@ kept in `fixed/draft/` and `mixed/draft/`. Training overwrites are rejected; opt
 resume is not implemented. `eval`/`summarize` stages reuse an existing comparison
 root and its stored step count. Evaluation always uses the data file's content-hash
 holdout, so the old length-head validation file does not limit testing to 32 prompts.
+
+## Native verl OPD experiment
+
+For original verl/FSDP/SGLang OPD with mixed **response training** widths and
+native rejection replay, see [native OPD notes](../../../scripts/adaptive_length/NATIVE_OPD.md).
+The launcher is `scripts/adaptive_length/native_opd.sh fixed|mixed`. This is distinct
+from the standalone reference training comparison above. Rollout stays native-width;
+this extension does not claim fully multi-width on-policy rollout.

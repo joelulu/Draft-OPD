@@ -199,12 +199,19 @@ def compute_opd_distillation_metrics(
 
     mean_metric_keys = {
         "opd_attention_impl_id": "distillation/opd_attention_impl_id",
+        "opd_train_response_candidates": "distillation/opd_train_response_candidates",
+        "opd_native_replay_candidates": "distillation/opd_native_replay_candidates",
+        "opd_mixed_response_training": "distillation/opd_mixed_response_training",
         "opd_profile_teacher_forward_ms": "distillation/opd_profile_teacher_forward_ms",
         "opd_profile_draft_forward_ms": "distillation/opd_profile_draft_forward_ms",
         "opd_profile_lm_head_ms": "distillation/opd_profile_lm_head_ms",
         "opd_profile_total_forward_ms": "distillation/opd_profile_total_forward_ms",
         "eagle3_response_loss_mode_id": "eagle3/response_loss_mode_id",
     }
+    for k in range(1, 33):
+        key = f"opd_train_width_{k}_fraction"
+        if key in model_output:
+            mean_metric_keys[key] = f"distillation/{key}"
     for source_key, metric_key in mean_metric_keys.items():
         value = model_output.get(source_key)
         if value is None:

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-unset RAY_ADDRESS
-pkill -9 ray
-pkill -9 python
-sleep 1
-export RAY_ADDRESS=local
 set -xeuo pipefail
+unset RAY_ADDRESS
+if [[ ${RESET_RAY_RUNTIME:-False} == True ]]; then
+    ray stop --force
+fi
+export RAY_ADDRESS=local
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 

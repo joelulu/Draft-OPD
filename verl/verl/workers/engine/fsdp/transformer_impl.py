@@ -1998,6 +1998,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 ("dflash_opd_target_token_count", "opd_target_token_count"),
                 ("dflash_opd_rejected_draft_token_count", "opd_rejected_draft_token_count"),
                 ("dflash_opd_attention_impl_id", "opd_attention_impl_id"),
+                ("dflash_opd_train_response_candidates", "opd_train_response_candidates"),
+                ("dflash_opd_native_replay_candidates", "opd_native_replay_candidates"),
+                ("dflash_opd_mixed_response_training", "opd_mixed_response_training"),
                 ("dflash_opd_profile_teacher_forward_ms", "opd_profile_teacher_forward_ms"),
                 ("dflash_opd_profile_draft_forward_ms", "opd_profile_draft_forward_ms"),
                 ("dflash_opd_profile_lm_head_ms", "opd_profile_lm_head_ms"),
@@ -2010,6 +2013,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 value = output.get(source_key) if isinstance(output, dict) else getattr(output, source_key, None)
                 if value is not None:
                     model_output[output_key] = value
+            for k in range(1, 33):
+                source_key = f"dflash_opd_train_width_{k}_fraction"
+                value = output.get(source_key) if isinstance(output, dict) else getattr(output, source_key, None)
+                if value is not None:
+                    model_output[f"opd_train_width_{k}_fraction"] = value
             for state_group in (
                 "matched_target_trajectory",
                 "accepted_replay",
