@@ -103,3 +103,40 @@ The native launcher runs a tiny padding roundtrip before initializing Ray/models
 so this dependency path is checked before an expensive multi-GPU startup.
 
 Regression tests: `python -m pytest -q diffusion/dflash/tests/test_attention_padding_fallback.py`.
+
+## Diagnose fixed versus mixed after export
+
+Analyze an existing three-arm evaluation, with no GPU/model loading:
+
+```bash
+python scripts/adaptive_length/analyze_native_eval.py \
+  --root runs/native_opd_eval_20261106_100359
+```
+
+This requires complete, identical prompt/K grids across initial/fixed/mixed,
+matching generation metadata, valid positive timings, and profiling disabled.
+It writes `analysis/comparison.csv`, `choices.csv`, and `report.json`.
+Throughput is total emitted tokens divided by total decode time, never an
+arithmetic mean of per-prompt token rates. The per-prompt hindsight selection
+chooses the fastest K after seeing all results. It is an optimistic in-sample
+reference affected by timing noise and selection bias, not a trained policy,
+a bound on per-round selection, or evidence about output quality.
+
+Repeat measurements using already exported models (no training/re-export):
+
+```bash
+MODEL_ROOT="$PWD/runs/native_opd_eval_20261106_100359" \
+VAL_JSONL="$PWD/../data/opd_val_32.jsonl" \
+EVAL_GPU=7 REPEATS=3 EVAL_SAMPLES=32 MAX_NEW_TOKENS=256 \
+bash scripts/adaptive_length/repeat_native_eval.sh
+```
+
+Fixed/mixed order alternates; initial is measured each repeat. Every evaluation
+uses B=1, the same GPU and data, no head, and non-strict matching. Use an idle
+GPU. Output must be a fresh directory. Analysis reports pooled throughput and
+per-repeat median/range; hindsight choices use pooled measurements per prompt.
+The runner records the data path and SHA256. This does not establish that data
+is independent of training: replace VAL_JSONL with a separate held-out test set
+before making generalization claims. Different speculative modes can emit
+different outputs/token counts, so the oracle optimizes their measured token
+rates, not a common fixed-output latency task.
