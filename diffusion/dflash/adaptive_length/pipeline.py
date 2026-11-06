@@ -6,6 +6,8 @@ import json
 import os
 import random
 from contextlib import nullcontext
+from collections import Counter
+import time
 from pathlib import Path
 
 import torch
@@ -15,6 +17,7 @@ from model.dflash import DFlashDraftModel
 from .head import LengthHead, select_lengths, validate_lengths
 from .runtime import RoundRuntime, clock
 from .evaluation import actual_length, fixed_lengths, StageTimer
+from .training import width_plan
 
 
 def read_prompts(path):
@@ -392,53 +395,90 @@ def opd_loss(draft_logits, target_logits, accepted):
 
 
 def train_draft(args):
-    target, draft, tokenizer, rows, rank, world = setup(args)
     if args.split != "train":
         raise ValueError("Draft training requires --split train; reserve held-out prompt groups.")
+    budget = args.candidate_tokens_per_update
+    if args.steps < 1 or args.save_every < 1 or args.log_every < 1 or budget < 0:
+        raise ValueError("Training steps/save/log intervals must be positive, budget nonnegative.")
+    if budget:
+        width_plan(args.lengths, budget, random.Random(args.seed))  # fail before loading weights
+    target, draft, tokenizer, rows, rank, world = setup(args)
+    # FP32 trainable parameters + AdamW states; frozen target remains BF16.
+    # Autocast keeps draft CUDA matmuls BF16 without losing small optimizer updates.
+    draft.float()
     model = draft
     if world > 1:
         torch.distributed.init_process_group("nccl")
-        model = torch.nn.parallel.DistributedDataParallel(draft, device_ids=[target.device.index])
+        model = torch.nn.parallel.DistributedDataParallel(
+            draft, device_ids=[target.device.index], broadcast_buffers=False)
     opt = torch.optim.AdamW(draft.parameters(), lr=args.lr)
     generator = random.Random(args.seed + rank)
-    prefix, prompt_len, row_index = None, None, 0
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    # Fixed update count on every rank prevents EOS-dependent DDP deadlocks.
+    if (output / f"train_rank{rank:03d}.jsonl").exists():
+        raise FileExistsError("Use a fresh training output directory; optimizer resume is not implemented.")
+    metadata = dict(lengths=list(args.lengths), planned_steps=args.steps, seed=args.seed,
+        world_size=world, candidate_tokens_per_rank_per_update=budget or None,
+        prompt_schedule="one prompt per optimizer update; same rank/order/seed across arms",
+        objective="accepted-forward-kl_rejected-suffix-reverse-kl",
+        target=args.target, initial_draft=args.draft, learning_rate=args.lr,
+        train_data=args.data, split=args.split, max_prompt=args.max_prompt,
+        max_new_tokens=args.max_new_tokens, train_parameters_dtype="float32",
+        local_prompt_keys=[key for key, _ in rows])
+    (output / f"training_rank{rank:03d}.json").write_text(json.dumps(metadata, indent=2))
+    seen_tokens, width_counts, start_time = 0, Counter(), time.perf_counter()
     for step in range(args.steps):
-        if prefix is None:
-            _, prompt = rows[row_index % len(rows)]
-            row_index += 1
-            prefix = encode(tokenizer, prompt, args, target.device)
-            prompt_len = prefix.shape[1]
-        # Rebuild target/draft history after each weight update: never reuse stale
-        # draft K/V projected by an older checkpoint. This is a correctness reference.
-        state = RoundRuntime(target, draft, prefix)
-        k = generator.choice(args.lengths)
-        draft.train()
+        # Prompt assignment is independent of accepted lengths and RNG consumption.
+        # Rollout prefixes within this prompt may differ between trained drafters.
+        key, prompt = rows[step % len(rows)]
+        initial_ids = encode(tokenizer, prompt, args, target.device)
+        prefix, prompt_len = initial_ids, initial_ids.shape[1]
+        plan = width_plan(args.lengths, budget, generator) if budget else [generator.choice(args.lengths)]
+        token_count, loss_value, accepted_sum = sum(plan), 0.0, 0
         opt.zero_grad(set_to_none=True)
-        block, logits = state.propose(k, return_logits=True, forward_model=model)
-        result, target_logits = state.verify(block, keep_cache=True, return_logits=True)
-        loss = opd_loss(logits, target_logits, result[0])
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0)
+        draft.train()
+        for micro, k in enumerate(plan):
+            # Recompute history: never backprop through previous verification rounds
+            # or reuse draft K/V carrying a previous microbatch's freed graph.
+            state = RoundRuntime(target, draft, prefix)
+            sync = model.no_sync() if world > 1 and micro < len(plan)-1 else nullcontext()
+            with sync:
+                with torch.autocast(device_type=target.device.type, dtype=torch.bfloat16,
+                                    enabled=target.device.type == "cuda"):
+                    block, logits = state.propose(k, return_logits=True, forward_model=model)
+                result, target_logits = state.verify(block, keep_cache=True, return_logits=True)
+                loss = opd_loss(logits, target_logits, result[0]) * (k / token_count)
+                loss.backward()
+            loss_value += float(loss.detach())
+            accepted_sum += result[0]
+            width_counts[k] += 1
+            with torch.no_grad():
+                state.advance(block, result, cache_kept=True)
+                prefix = state.prefix.detach()
+                if stopped(state, prompt_len, args.max_new_tokens, tokenizer.eos_token_id):
+                    prefix = initial_ids
+            del state, logits, target_logits, loss, block, result
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0))
         opt.step()
         draft.eval()
-        with torch.no_grad():
-            state.advance(block, result, cache_kept=True)
-            prefix = state.prefix.detach()
-            if stopped(state, prompt_len, args.max_new_tokens, tokenizer.eos_token_id):
-                prefix = None
+        seen_tokens += token_count
+        record = dict(step=step+1, prompt_key=key, rank=rank, world_size=world,
+            loss=loss_value, grad_norm=grad_norm, candidate_tokens=token_count,
+            cumulative_candidate_tokens_per_rank=seen_tokens,
+            microbatches=len(plan), width_counts=dict(Counter(plan)),
+            mean_accepted=accepted_sum/len(plan), elapsed_s=time.perf_counter()-start_time)
+        with (output / f"train_rank{rank:03d}.jsonl").open("a") as stream:
+            stream.write(json.dumps(record)+"\n")
         if rank == 0 and (step % args.log_every == 0 or step + 1 == args.steps):
-            print(json.dumps(dict(step=step+1, loss=float(loss.detach()), k=k,
-                                  accepted=result[0], world_size=world)), flush=True)
+            print(json.dumps(record), flush=True)
         if (step + 1) % args.save_every == 0 or step + 1 == args.steps:
             if rank == 0:
                 path = output / f"step_{step + 1:06d}"
                 draft.save_pretrained(path)
-                (path / "adaptive_training.json").write_text(json.dumps(dict(
-                    lengths=args.lengths, steps=step+1, seed=args.seed, world_size=world,
-                    objective="accepted-forward-kl_rejected-suffix-reverse-kl", target=args.target), indent=2))
+                (path / "adaptive_training.json").write_text(json.dumps(dict(metadata,
+                    steps=step+1, cumulative_candidate_tokens_per_rank=seen_tokens,
+                    global_candidate_tokens=seen_tokens*world if budget else None,
+                    rank0_width_counts=dict(width_counts)), indent=2))
             if world > 1:
                 torch.distributed.barrier()
     if world > 1:
@@ -473,6 +513,8 @@ def main():
         if name == "train-draft":
             q.set_defaults(split="train")
             q.add_argument("--steps", type=int, default=1000)
+            q.add_argument("--candidate-tokens-per-update", type=int, default=0,
+                           help="Exact supervised candidate budget per rank/update; 0 keeps one block per update.")
             q.add_argument("--save-every", type=int, default=250)
             q.add_argument("--log-every", type=int, default=10)
             q.add_argument("--lr", type=float, default=3e-4)

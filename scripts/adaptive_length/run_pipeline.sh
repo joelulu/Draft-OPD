@@ -5,7 +5,11 @@ cd "$ROOT"
 STAGE=${1:-all}
 case "$STAGE" in all|train-draft|collect|train-head|eval) ;; *) echo "usage: $0 [all|train-draft|collect|train-head|eval]" >&2; exit 2;; esac
 if [[ -z ${PYTHON_BIN:-} ]]; then
-    source "$ROOT/.venv-draftopd/bin/activate"
+    if [[ -f "$ROOT/.venv-draftopd/bin/activate" ]]; then
+        source "$ROOT/.venv-draftopd/bin/activate"
+    else
+        source "$ROOT/../.venv-draftopd/bin/activate"
+    fi
     PYTHON_BIN=$(command -v python)
 fi
 CUDA_ROOT=${CUDA_ROOT:-/home/jovyan/LLM/cuda-12.9}
@@ -29,8 +33,10 @@ COMMON=(--target "$TARGET_MODEL" --draft "$DRAFT_MODEL" --max-prompt "${MAX_PROM
 LAUNCH=("$PYTHON_BIN")
 if (( NPROC > 1 )); then LAUNCH+=( -m torch.distributed.run --standalone --nproc_per_node "$NPROC" ); fi
 if [[ "$STAGE" == train-draft ]]; then
+    read -r -a TRAIN_WIDTHS <<< "${TRAIN_LENGTHS:-4 8 12 16 24 32}"
     "${LAUNCH[@]}" -m adaptive_length.pipeline train-draft "${COMMON[@]}" --data "$TRAIN_DATA" \
         --max-samples "${TRAIN_SAMPLES:-0}" --steps "${TRAIN_STEPS:-1000}" \
+        --lengths "${TRAIN_WIDTHS[@]}" --candidate-tokens-per-update "${CANDIDATE_TOKENS_PER_UPDATE:-0}" \
         --lr "${LR:-3e-4}" --save-every "${SAVE_FREQ:-250}" --output "$RESULT_ROOT/draft" \
         2>&1 | tee "$RESULT_ROOT/train_draft.log"
 fi
@@ -53,9 +59,13 @@ if [[ "$STAGE" == all || "$STAGE" == eval ]]; then
     EVAL_FLAGS=()
     if [[ ${STRICT_MATCH:-0} == 1 ]]; then EVAL_FLAGS+=(--strict-match); fi
     if [[ ${PROFILE_ROUNDS:-0} == 1 ]]; then EVAL_FLAGS+=(--profile-rounds); fi
-    HEAD_PATH=${HEAD_PATH:-$RESULT_ROOT/head.pt}
+    if [[ ${NO_HEAD:-0} != 1 ]]; then
+        HEAD_PATH=${HEAD_PATH:-$RESULT_ROOT/head.pt}
+        EVAL_FLAGS+=(--head "$HEAD_PATH")
+    fi
+    EVAL_SPLIT=${EVAL_DATA_SPLIT:-$EVAL_SPLIT}
     EVAL_OUTPUT=${EVAL_OUTPUT:-$RESULT_ROOT/eval_v2}
     "$PYTHON_BIN" -m adaptive_length.pipeline eval "${COMMON[@]}" --data "$VAL_DATA" \
-        --split "$EVAL_SPLIT" --max-samples "${EVAL_SAMPLES:-32}" --head "$HEAD_PATH" \
+        --split "$EVAL_SPLIT" --max-samples "${EVAL_SAMPLES:-32}" \
         "${EVAL_FLAGS[@]}" --output "$EVAL_OUTPUT" 2>&1 | tee "$RESULT_ROOT/eval.log"
 fi

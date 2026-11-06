@@ -139,3 +139,53 @@ compute time. Total decode includes host control, timing and accounting overhead
 Use `PROFILE_ROUNDS=0` (default) for primary speed comparisons; stage columns are
 blank in that mode. Compare profiling runs only against other profiling runs.
 Do not combine v1 and v2 timing results into one comparison.
+
+## Main experiment: fixed-vs-mixed OPD training (no length head)
+
+Run `bash scripts/adaptive_length/compare_training.sh all` with a fresh RESULT_ROOT.
+The script runs two sequential training arms from the same checkpoint, then evaluates
+**initial / fixed-trained / mixed-trained** at all fixed inference widths, including
+native `block_size-1`. It does not collect length-head labels, train a head or run
+an adaptive policy. Both arms use the same FP32 trainable parameters/AdamW states,
+BF16 CUDA autocast, loss, LR, seed, prompt split and per-rank prompt schedule.
+
+The fixed width is read from the original config (b16 usually means 15 candidates).
+Mixed widths are `{4,8,12,16,24,32}`. Default `CANDIDATE_TOKENS_PER_UPDATE=240`
+means **240 supervised candidate positions per rank per optimizer update** in both
+arms. Variable numbers of blocks are accumulated with loss weight `K/240`.
+The mixed plan samples feasible widths until exactly 240 positions are filled;
+remaining-budget constraints affect its sampling histogram, which is logged.
+DDP syncs gradients only on the last microbatch, with buffer broadcasts disabled
+so unequal numbers of microbatches per rank do not create collective mismatches.
+
+Default is 200 updates, 256 training prompts before rank sharding and 64 held-out
+prompts for evaluation, max output 256. For 8 ranks, total supervised positions
+per arm are `200 * 240 * 8 = 384000`. This matches supervision and update budgets,
+**not FLOPs or wall time**. Actual compute time and width histograms are recorded.
+Each update uses the same prompt in both arms; draft-induced prefixes and the
+number of anchors can differ. EOS/output-limit restarts continue on that prompt.
+
+Single-GPU smoke (same server model/data paths and parent venv are supported):
+
+```bash
+export RESULT_ROOT="$PWD/runs/fixed_vs_mixed_smoke_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES=7 NPROC=1 TRAIN_STEPS=2 TRAIN_SAMPLES=8 \
+EVAL_SAMPLES=4 MAX_NEW_TOKENS=64 \
+  bash scripts/adaptive_length/compare_training.sh all
+```
+
+After smoke passes, use a fresh RESULT_ROOT and e.g.
+`CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC=8 TRAIN_STEPS=200 TRAIN_SAMPLES=256
+EVAL_GPU=7 EVAL_SAMPLES=64 MAX_NEW_TOKENS=256`.
+Train arms run sequentially, each using all 8 cards; evaluation is single-GPU B=1.
+This is the standalone reference OPD trainer, not the original verl/FSDP stack.
+Recomputing prefixes each microbatch prioritizes correctness over training speed.
+
+`comparison.csv` combines all three models × fixed inference widths, including
+acceptance/throughput. `budget_check.json` checks candidate counts, steps, prompt
+schedule, initialization and optimizer controls; approximate GPU-hours are also
+reported. Per-rank training JSON/JSONL and final `save_pretrained` checkpoints are
+kept in `fixed/draft/` and `mixed/draft/`. Training overwrites are rejected; optimizer
+resume is not implemented. `eval`/`summarize` stages reuse an existing comparison
+root and its stored step count. Evaluation always uses the data file's content-hash
+holdout, so the old length-head validation file does not limit testing to 32 prompts.

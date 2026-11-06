@@ -227,3 +227,96 @@ def test_evaluation_clips_all_policies_and_preserves_accounting(tmp_path, monkey
     with (tmp_path / "summary_rank000.csv").open() as f:
         summary = list(csv.DictReader(f))
     assert len(summary) == len(records)
+
+
+def test_exact_candidate_budget_plans():
+    import random
+    from adaptive_length.training import width_plan
+    assert width_plan([15], 240, random.Random(42)) == [15] * 16
+    widths = [4, 8, 12, 16, 24, 32]
+    plan = width_plan(widths, 240, random.Random(42))
+    assert sum(plan) == 240 and set(plan) <= set(widths)
+    assert plan == width_plan(widths, 240, random.Random(42))
+    with pytest.raises(ValueError, match="cannot be tiled"):
+        width_plan([15], 64, random.Random(42))
+
+
+def test_matched_budget_real_training_updates_and_exports(tmp_path, monkeypatch):
+    import json
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    from model.dflash import DFlashDraftModel
+    from adaptive_length import pipeline
+    torch.manual_seed(72)
+    config = Qwen3Config(vocab_size=31, hidden_size=16, intermediate_size=32,
+                        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                        head_dim=8, max_position_embeddings=128, attn_implementation="sdpa")
+    target = Qwen3ForCausalLM(config).eval().requires_grad_(False)
+    dc = Qwen3Config(**config.to_dict())
+    dc.num_hidden_layers = 1
+    dc.num_target_layers = 2
+    dc.block_size = 5
+    dc.layer_types = ["full_attention"]
+    dc.dflash_config = dict(target_layer_ids=[0], mask_token_id=30)
+    dc._attn_implementation = "sdpa"
+    initial = DFlashDraftModel(dc).state_dict()
+    frozen = {k: v.clone() for k, v in target.state_dict().items()}
+    rows = [("first", []), ("second", [])]
+    monkeypatch.setattr(pipeline, "encode", lambda *args: torch.tensor([[1, 2, 3]]))
+    for arm, lengths in (("fixed", (4,)), ("mixed", (4, 8))):
+        draft = DFlashDraftModel(dc)
+        draft.load_state_dict(initial)
+        before = draft.fc.weight.detach().clone()
+        monkeypatch.setattr(pipeline, "setup", lambda args: (
+            target, draft, SimpleNamespace(eos_token_id=None), rows, 0, 1))
+        args = SimpleNamespace(split="train", candidate_tokens_per_update=24,
+            steps=2, save_every=2, log_every=1, seed=42, lr=1e-3, lengths=lengths,
+            output=str(tmp_path / arm), target="target", draft="initial", data="train.jsonl",
+            max_prompt=32, max_new_tokens=16)
+        pipeline.train_draft(args)
+        assert not torch.equal(draft.fc.weight, before)
+        logs = [json.loads(s) for s in (tmp_path / arm / "train_rank000.jsonl").read_text().splitlines()]
+        assert [r["prompt_key"] for r in logs] == ["first", "second"]
+        assert [r["candidate_tokens"] for r in logs] == [24, 24]
+        assert logs[-1]["cumulative_candidate_tokens_per_rank"] == 48
+        saved = json.loads((tmp_path / arm / "step_000002/adaptive_training.json").read_text())
+        assert saved["global_candidate_tokens"] == 48
+        for key, value in target.state_dict().items():
+            torch.testing.assert_close(value, frozen[key])
+
+
+def test_comparison_report_rejects_unmatched_budgets(tmp_path):
+    import csv
+    import json
+    from adaptive_length.compare_training import build_comparison
+    plan = dict(nproc=1, steps=1, candidate_tokens_per_rank_per_update=240,
+                fixed_k=15, mixed_lengths=[4,8,12,16,24,32])
+    (tmp_path / 'comparison_plan.json').write_text(json.dumps(plan))
+    for arm in ['initial', 'fixed', 'mixed']:
+        folder = tmp_path / arm / 'eval_fixed'
+        folder.mkdir(parents=True)
+        (folder / 'results_rank000.jsonl').write_text(json.dumps(dict(prompt_key='heldout', mode='fixed_15'))+'\n')
+        with (folder / 'summary_rank000.csv').open('w') as stream:
+            writer = csv.DictWriter(stream, fieldnames=['mode','decode_tok_s'])
+            writer.writeheader()
+            writer.writerow(dict(mode='fixed_15', decode_tok_s=100))
+        if arm == 'initial':
+            continue
+        folder = tmp_path / arm / 'draft'
+        folder.mkdir()
+        meta = dict(initial_draft='same', target='target', seed=42, world_size=1,
+            learning_rate=0.001, train_data='same-data', split='train', max_prompt=512,
+            max_new_tokens=256, local_prompt_keys=['train-prompt'], planned_steps=1,
+            candidate_tokens_per_rank_per_update=240, train_parameters_dtype='float32',
+            lengths=[15] if arm == 'fixed' else plan['mixed_lengths'])
+        (folder / 'training_rank000.json').write_text(json.dumps(meta))
+        (folder / 'train_rank000.jsonl').write_text(json.dumps(dict(step=1, candidate_tokens=240,
+            cumulative_candidate_tokens_per_rank=240, elapsed_s=1.0))+'\n')
+    report = build_comparison(tmp_path)
+    assert report['budget_matched']
+    assert (tmp_path / 'comparison.csv').exists()
+    path = tmp_path / 'mixed/draft/train_rank000.jsonl'
+    row = json.loads(path.read_text())
+    row['candidate_tokens'] = 239
+    path.write_text(json.dumps(row)+'\n')
+    with pytest.raises(ValueError, match='unmatched training budget'):
+        build_comparison(tmp_path)
