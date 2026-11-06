@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -13,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from model.dflash import DFlashDraftModel
 from .head import LengthHead, select_lengths, validate_lengths
 from .runtime import RoundRuntime, clock
+from .evaluation import actual_length, fixed_lengths, StageTimer
 
 
 def read_prompts(path):
@@ -245,20 +247,50 @@ def load_head(path, device, args):
     return head, checkpoint["costs_ms"]
 
 
+def summarize(records, modes):
+    summary = []
+    for mode in modes:
+        group = [r for r in records if r["mode"] == mode]
+        tokens, seconds = sum(r["tokens"] for r in group), sum(r["decode_s"] for r in group)
+        spec = sum(r["spec_rounds"] for r in group)
+        core = sum(r["non_tail_spec_rounds"] for r in group)
+        row = dict(mode=mode, tokens=tokens, decode_s=seconds, decode_tok_s=tokens/seconds,
+                   matches=sum(r["match"] for r in group), samples=len(group),
+                   spec_rounds=spec, ar_steps=sum(r["ar_steps"] for r in group),
+                   tail_spec_rounds=sum(r["tail_spec_rounds"] for r in group),
+                   mean_accepted=sum(r["accepted_tokens"] for r in group)/spec if spec else None,
+                   mean_committed=sum(r["spec_committed_tokens"] for r in group)/spec if spec else None,
+                   non_tail_spec_rounds=core,
+                   non_tail_mean_accepted=sum(r["non_tail_accepted_tokens"] for r in group)/core if core else None,
+                   non_tail_mean_committed=sum(r["non_tail_committed_tokens"] for r in group)/core if core else None,
+                   profile_rounds=group[0]["profile_rounds"])
+        for name in StageTimer.names:
+            row[name] = sum(r[name] for r in group) if group[0]["profile_rounds"] else None
+        summary.append(row)
+    return summary
+
+
 def evaluate(args):
     target, draft, tokenizer, rows, rank, world = setup(args)
     head, costs = load_head(args.head, target.device, args) if args.head else (None, None)
-    modes = ["ar"] + [f"fixed_{k}" for k in args.lengths] + (["adaptive"] if head else [])
+    widths = fixed_lengths(args.lengths, draft.block_size, args.fixed_lengths or [])
+    modes = ["ar"] + [f"fixed_{k}" for k in widths] + (["adaptive"] if head else [])
     records = []
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / f"rounds_rank{rank:03d}.jsonl").write_text("")
+    metadata = dict(schema=2, native_block_size=int(draft.block_size), fixed_lengths=widths,
+                    head_lengths=list(head.lengths) if head else None,
+                    tail_policy="min(requested_K, remaining-1); AR only with one token left",
+                    profile_rounds=args.profile_rounds, strict_match=args.strict_match,
+                    seed=args.seed, max_new_tokens=args.max_new_tokens)
+    (outdir / f"metadata_rank{rank:03d}.json").write_text(json.dumps(metadata, indent=2))
     with torch.inference_mode():
         for key, prompt in rows:
             ids = encode(tokenizer, prompt, args, target.device)
-            # Warm each kernel width before timing this prompt; no oracle labels used.
             if args.warmup:
                 warm = RoundRuntime(target, draft, ids)
-                for k in args.lengths:
+                for k in widths:
                     warm.propose(k)
                 del warm
             reference = None
@@ -266,53 +298,83 @@ def evaluate(args):
                 t0 = clock()
                 state = RoundRuntime(target, draft, ids)
                 prefill_s = clock() - t0
-                actions, rounds = [], 0
+                round_records = []
+                timer = StageTimer(args.profile_rounds, target.device)
+                def measure(name):
+                    return timer.measure(name) if timer.enabled else nullcontext()
                 t0 = clock()
                 while not stopped(state, ids.shape[1], args.max_new_tokens, tokenizer.eos_token_id):
                     remaining = args.max_new_tokens - (state.prefix.shape[1] - ids.shape[1])
-                    allowed = [k for k in args.lengths if k + 1 <= remaining]
-                    if mode == "ar" or not allowed:
-                        state.ar_step()
-                        k = 0
-                    else:
+                    requested = 0
+                    if mode != "ar" and remaining > 1:
                         if mode == "adaptive":
-                            pivot, anchor = state.features()
-                            choice = select_lengths(head(pivot, anchor), costs, head.lengths, remaining)
-                            k = head.lengths[int(choice.item())]
+                            with measure("head_ms"):
+                                pivot, anchor = state.features()
+                                # Select the learned nominal action, then apply exactly the
+                                # same tail clipping as every fixed policy. No extrapolated
+                                # acceptance/cost labels for unseen tail widths are invented.
+                                choice = select_lengths(head(pivot, anchor), costs, head.lengths)
+                                requested = head.lengths[int(choice.item())]
                         else:
-                            k = int(mode.split("_")[1])
-                            if k + 1 > remaining:
-                                state.ar_step()
-                                actions.append(0)
-                                rounds += 1
-                                continue
-                        state.step(k)
-                    actions.append(k)
-                    rounds += 1
-                decode_s = clock() - t0
+                            requested = int(mode.split("_")[1])
+                    k = actual_length(requested, remaining) if requested else 0
+                    if k:
+                        with measure("draft_ms"):
+                            block = state.propose(k)
+                        with measure("verify_ms"):
+                            result = state.verify(block, keep_cache=True)
+                            committed = state.advance(block, result, cache_kept=True)
+                        accepted = result[0]
+                    else:
+                        with measure("ar_ms"):
+                            committed = state.ar_step()
+                        accepted = 0
+                    round_records.append(dict(requested_k=requested, actual_k=k,
+                        remaining=remaining, tail=(0 < k < requested),
+                        accepted_raw=accepted, accepted=accepted, committed=committed))
+                decode_s = clock() - t0  # final CUDA synchronization resolves event timestamps
                 generated = trim_generated(state.prefix[0, ids.shape[1]:], args.max_new_tokens,
                                             tokenizer.eos_token_id).cpu()
+                # Verification can commit beyond EOS inside a block. Count only emitted
+                # tokens in acceptance summaries; keep raw acceptance for diagnostics.
+                excess = state.prefix.shape[1] - ids.shape[1] - len(generated)
+                if excess:
+                    last = round_records[-1]
+                    last["committed"] -= excess
+                    last["accepted"] = max(0, last["committed"] - 1)
                 if mode == "ar":
                     reference = generated
                 match = torch.equal(generated, reference)
-                rec = dict(prompt_key=key, mode=mode, tokens=len(generated), rounds=rounds,
-                           prefill_s=prefill_s, decode_s=decode_s,
-                           decode_tok_s=len(generated)/decode_s, match=match, actions=actions)
+                spec = [r for r in round_records if r["actual_k"]]
+                core = [r for r in spec if not r["tail"]]
+                rec = dict(prompt_key=key, mode=mode, tokens=len(generated), rounds=len(round_records),
+                           prefill_s=prefill_s, decode_s=decode_s, decode_tok_s=len(generated)/decode_s,
+                           match=match, actions=[r["actual_k"] for r in round_records],
+                           requested_actions=[r["requested_k"] for r in round_records],
+                           spec_rounds=len(spec), ar_steps=len(round_records)-len(spec),
+                           tail_spec_rounds=len(spec)-len(core),
+                           accepted_tokens=sum(r["accepted"] for r in spec),
+                           spec_committed_tokens=sum(r["committed"] for r in spec),
+                           non_tail_spec_rounds=len(core),
+                           non_tail_accepted_tokens=sum(r["accepted"] for r in core),
+                           non_tail_committed_tokens=sum(r["committed"] for r in core),
+                           profile_rounds=args.profile_rounds, **timer.resolve())
+                rec["mean_accepted"] = rec["accepted_tokens"]/len(spec) if spec else None
+                rec["mean_committed"] = rec["spec_committed_tokens"]/len(spec) if spec else None
                 records.append(rec)
                 print(json.dumps(rec), flush=True)
+                # Save each completed method so a later interruption preserves results.
+                with (outdir / f"rounds_rank{rank:03d}.jsonl").open("a") as stream:
+                    stream.write(json.dumps(dict(prompt_key=key, mode=mode, rounds=round_records))+"\n")
+                (outdir / f"results_rank{rank:03d}.jsonl").write_text(
+                    "".join(json.dumps(r)+"\n" for r in records))
                 if not match and args.strict_match:
-                    (outdir / f"results_rank{rank:03d}.jsonl").write_text(
-                        "".join(json.dumps(r)+"\n" for r in records))
-                    raise RuntimeError(f"Greedy token mismatch: {key}, {mode}. No lossless speed claim allowed.")
-    (outdir / f"results_rank{rank:03d}.jsonl").write_text("".join(json.dumps(r)+"\n" for r in records))
+                    raise RuntimeError(f"Greedy token mismatch: {key}, {mode}.")
+    summary = summarize(records, modes)
     with (outdir / f"summary_rank{rank:03d}.csv").open("w") as f:
-        writer = csv.DictWriter(f, fieldnames=["mode", "tokens", "decode_s", "decode_tok_s", "matches", "samples"])
+        writer = csv.DictWriter(f, fieldnames=list(summary[0]))
         writer.writeheader()
-        for mode in modes:
-            group = [r for r in records if r["mode"] == mode]
-            tokens, seconds = sum(r["tokens"] for r in group), sum(r["decode_s"] for r in group)
-            writer.writerow(dict(mode=mode, tokens=tokens, decode_s=seconds, decode_tok_s=tokens/seconds,
-                                 matches=sum(r["match"] for r in group), samples=len(group)))
+        writer.writerows(summary)
 
 
 def opd_loss(draft_logits, target_logits, accepted):
@@ -405,6 +467,8 @@ def main():
         if name == "eval":
             q.add_argument("--head")
             q.add_argument("--strict-match", action="store_true")
+            q.add_argument("--fixed-lengths", type=int, nargs="+", help="Additional fixed baselines; head actions stay unchanged.")
+            q.add_argument("--profile-rounds", action="store_true", help="Optional stage CUDA events; compare speeds with profiling off.")
             q.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
         if name == "train-draft":
             q.set_defaults(split="train")

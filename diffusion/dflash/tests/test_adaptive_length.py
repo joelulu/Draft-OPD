@@ -166,3 +166,64 @@ def test_real_draft_training_backward_and_fresh_cache():
         with torch.no_grad():
             runtime.advance(block, result, cache_kept=True)
             prefix = runtime.prefix.detach()
+
+
+def test_shared_tail_policy_and_native_baseline():
+    from adaptive_length.evaluation import actual_length, fixed_lengths
+    assert actual_length(32, 3) == 2
+    assert actual_length(4, 3) == 2
+    assert actual_length(12, 1) == 0
+    assert fixed_lengths([4, 8, 16, 32], 16) == [4, 8, 15, 16, 32]
+
+
+@pytest.mark.parametrize("budget", [1, 3, 19])
+@pytest.mark.parametrize("eos", [None, 0])
+def test_evaluation_clips_all_policies_and_preserves_accounting(tmp_path, monkeypatch, budget, eos):
+    import json
+    import csv
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    from model.dflash import DFlashDraftModel
+    from adaptive_length import pipeline
+    config = Qwen3Config(vocab_size=31, hidden_size=16, intermediate_size=32,
+                        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                        head_dim=8, max_position_embeddings=128, attn_implementation="sdpa")
+    target = Qwen3ForCausalLM(config).eval().requires_grad_(False)
+    with torch.no_grad():
+        target.lm_head.weight.zero_()  # all draft proposals accepted, exact predictable tail
+    dc = Qwen3Config(**config.to_dict())
+    dc.num_hidden_layers = 1
+    dc.num_target_layers = 2
+    dc.block_size = 16
+    dc.layer_types = ["full_attention"]
+    dc.dflash_config = dict(target_layer_ids=[0], mask_token_id=30)
+    dc._attn_implementation = "sdpa"
+    draft = DFlashDraftModel(dc).eval()
+    class Head(nn.Module):
+        lengths = (4, 8)
+        def forward(self, pivot, anchor):
+            return pivot.new_tensor([[1., 7.]])
+    monkeypatch.setattr(pipeline, "setup", lambda args: (
+        target, draft, SimpleNamespace(eos_token_id=eos), [("key", [])], 0, 1))
+    monkeypatch.setattr(pipeline, "encode", lambda *args: torch.tensor([[1, 2, 3]]))
+    monkeypatch.setattr(pipeline, "load_head", lambda *args: (Head(), [1., 1.]))
+    args = SimpleNamespace(head="existing-head.pt", lengths=(4, 8), fixed_lengths=[12],
+        output=str(tmp_path), profile_rounds=True, strict_match=False, warmup=True,
+        seed=42, max_new_tokens=budget)
+    pipeline.evaluate(args)
+    records = [json.loads(line) for line in (tmp_path / "results_rank000.jsonl").read_text().splitlines()]
+    assert {r["mode"] for r in records} == {"ar", "fixed_4", "fixed_8", "fixed_12", "fixed_15", "adaptive"}
+    for rec in records:
+        assert rec["tokens"] == (1 if eos == 0 else budget) and rec["match"]
+        assert rec["head_ms"] >= 0
+        if rec["mode"] != "ar":
+            assert rec["ar_steps"] <= 1
+        assert rec["spec_committed_tokens"] + rec["ar_steps"] == rec["tokens"]
+        assert rec["accepted_tokens"] + rec["spec_rounds"] == rec["spec_committed_tokens"]
+    rounds = [json.loads(line) for line in (tmp_path / "rounds_rank000.jsonl").read_text().splitlines()]
+    for method in rounds:
+        for step in method["rounds"]:
+            if step["actual_k"]:
+                assert step["actual_k"] == min(step["requested_k"], step["remaining"] - 1)
+    with (tmp_path / "summary_rank000.csv").open() as f:
+        summary = list(csv.DictReader(f))
+    assert len(summary) == len(records)

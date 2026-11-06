@@ -50,7 +50,12 @@ if [[ "$STAGE" == all || "$STAGE" == eval ]]; then
     VAL_DATA=${VAL_JSONL:-$ROOT/data/opd_val_32.jsonl}
     EVAL_SPLIT=all
     if [[ ! -f "$VAL_DATA" ]]; then VAL_DATA=$TRAIN_DATA; EVAL_SPLIT=val; fi
+    EVAL_FLAGS=()
+    if [[ ${STRICT_MATCH:-0} == 1 ]]; then EVAL_FLAGS+=(--strict-match); fi
+    if [[ ${PROFILE_ROUNDS:-0} == 1 ]]; then EVAL_FLAGS+=(--profile-rounds); fi
+    HEAD_PATH=${HEAD_PATH:-$RESULT_ROOT/head.pt}
+    EVAL_OUTPUT=${EVAL_OUTPUT:-$RESULT_ROOT/eval_v2}
     "$PYTHON_BIN" -m adaptive_length.pipeline eval "${COMMON[@]}" --data "$VAL_DATA" \
-        --split "$EVAL_SPLIT" --max-samples "${EVAL_SAMPLES:-32}" --head "$RESULT_ROOT/head.pt" \
-        --strict-match --output "$RESULT_ROOT/eval" 2>&1 | tee "$RESULT_ROOT/eval.log"
+        --split "$EVAL_SPLIT" --max-samples "${EVAL_SAMPLES:-32}" --head "$HEAD_PATH" \
+        "${EVAL_FLAGS[@]}" --output "$EVAL_OUTPUT" 2>&1 | tee "$RESULT_ROOT/eval.log"
 fi
