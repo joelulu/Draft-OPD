@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 STAGE=${1:-help}
@@ -58,7 +59,8 @@ if [[ "$STAGE" == train-classifiers || "$STAGE" == classifier-smoke ]]; then
     if [[ "$STAGE" == classifier-smoke ]]; then export HEAD_EPOCHS=1; fi
     exec "$PYTHON_BIN" -m adaptive_length.two_stage.cli train "${COMMON[@]}" \
         --data "$RESULT_ROOT/labeled" --output "$RESULT_ROOT/classifiers" \
-        --epochs "${HEAD_EPOCHS:-10}" --accumulate "${CLASSIFIER_ACCUMULATE:-16}" --lr "${CLASSIFIER_LR:-1e-4}" "$@"
+        --epochs "${HEAD_EPOCHS:-10}" --accumulate "${CLASSIFIER_ACCUMULATE:-16}" --lr "${CLASSIFIER_LR:-1e-4}" \
+        --log-every "${CLASSIFIER_LOG_EVERY:-100}" --log-seconds "${CLASSIFIER_LOG_SECONDS:-30}" "$@"
 fi
 if [[ "$STAGE" == eval || "$STAGE" == eval-smoke ]]; then
     if [[ "$STAGE" == eval-smoke ]]; then export EVAL_SAMPLES=4 MAX_NEW_TOKENS=128; fi

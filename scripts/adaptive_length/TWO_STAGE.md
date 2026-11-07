@@ -190,3 +190,17 @@ throughput comparison uses only held-out test prompts, never the selection set.
 AR token mismatches are recorded and do not abort. Speed labels do not establish
 output quality or losslessness. Dynamic policies can visit different states than
 the mixed-random collection policy; later data refresh can add policy trajectories.
+
+## Classifier progress logging
+
+Training prints phase/count information before fingerprint checks and model
+loading, at each epoch start, after the first state, then every 100 states or
+30 seconds (checked after completing a state). Reports include window-mean train
+CE for all four models, elapsed time, states/s and remaining time for that phase.
+Validation also prints progress; best checkpoint saves are announced. Change
+`CLASSIFIER_LOG_EVERY` / `CLASSIFIER_LOG_SECONDS` in the shell entrypoint, or
+`--log-every` / `--log-seconds` in the Python CLI. Output is flushed immediately.
+A process that already imported the older trainer will not acquire these logs
+by pulling files: they apply on the next launch. Do not restart a productive
+long-running job only to obtain progress logging; current inference/training
+checkpoints do not contain optimizer/epoch resume state for this trainer.

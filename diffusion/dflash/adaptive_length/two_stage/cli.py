@@ -15,6 +15,7 @@ from ..runtime import RoundRuntime, clock
 from . import K_VALUES
 from .classifier import KVClassifier, cache_pairs
 from .labels import calibrate, costs_for, make_labels
+from .progress import Progress
 
 
 def model_identity(path):
@@ -237,6 +238,7 @@ def iter_states(target, rows, seed=None):
 def train(args):
     if int(os.getenv('WORLD_SIZE', '1')) != 1:
         raise ValueError('Classifier trainer is single-GPU; collection supports multiple GPUs')
+    print(json.dumps(dict(event='classifier_setup', phase='checking_frozen_model_fingerprints')), flush=True)
     root = Path(args.data)
     manifest = json.loads((root/'manifest.json').read_text())
     if manifest['target'] != model_identity(args.target) or manifest['draft'] != model_identity(args.draft):
@@ -244,6 +246,8 @@ def train(args):
     rows = {s: [json.loads(v) for v in (root/f'{s}.jsonl').read_text().splitlines()] for s in ('train', 'val')}
     if {r['prompt_key'] for r in rows['train']} & {r['prompt_key'] for r in rows['val']}:
         raise ValueError('Train/validation prompt overlap')
+    print(json.dumps(dict(event='classifier_setup', phase='loading_target',
+        train_states=len(rows['train']), val_states=len(rows['val']), epochs=args.epochs)), flush=True)
     target, _ = load_models(args, draft=False)
     config = target.config
     torch.manual_seed(args.seed)
@@ -266,17 +270,27 @@ def train(args):
         for m, _ in models.values():
             m.train()
         count = 0
+        progress = Progress('train', epoch+1, len(rows['train']),
+            every=getattr(args, 'log_every', 100), seconds=getattr(args, 'log_seconds', 30.))
+        progress.report(0, optimizer_updates=0)
+        loss_window = {name: [] for name in models}
         for row, pairs, anchor in iter_states(target, rows['train'], args.seed+epoch):
             count += 1
             for name, (model, objective) in models.items():
                 y = torch.tensor([K_VALUES.index(row[f'label_{objective}_k'])], device=target.device)
                 loss = torch.nn.functional.cross_entropy(model(pairs, anchor), y)/args.accumulate
                 loss.backward()
+                loss_window[name].append(loss.detach()*args.accumulate)
             if count % args.accumulate == 0:
                 for name, (model, _) in models.items():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optim[name].step()
                     optim[name].zero_grad(set_to_none=True)
+            if progress.due(count):
+                # Synchronize only on reporting, never retain a training graph.
+                losses = {name: float(torch.stack(values).mean()) for name, values in loss_window.items()}
+                progress.report(count, optimizer_updates=count//args.accumulate, train_loss=losses)
+                loss_window = {name: [] for name in models}
         if count % args.accumulate:
             correction = args.accumulate/(count % args.accumulate)
             for name, (model, _) in models.items():
@@ -289,8 +303,11 @@ def train(args):
         totals = {name: dict(loss=0., correct=0, speed_ratio=0.) for name in models}
         for m, _ in models.values():
             m.eval()
+        validation_progress = Progress('validation', epoch+1, len(rows['val']),
+            every=getattr(args, 'log_every', 100), seconds=getattr(args, 'log_seconds', 30.))
+        validation_progress.report(0)
         with torch.no_grad():
-            for row, pairs, anchor in iter_states(target, rows['val']):
+            for val_count, (row, pairs, anchor) in enumerate(iter_states(target, rows['val']), 1):
                 for name, (model, objective) in models.items():
                     logits = model(pairs, anchor)
                     y = K_VALUES.index(row[f'label_{objective}_k'])
@@ -298,6 +315,8 @@ def train(args):
                     totals[name]['loss'] += float(torch.nn.functional.cross_entropy(logits, torch.tensor([y], device=target.device)))
                     totals[name]['correct'] += int(pred == y)
                     totals[name]['speed_ratio'] += row['speed_scores'][pred]/max(row['speed_scores'])
+                if validation_progress.due(val_count):
+                    validation_progress.report(val_count)
         for name, (model, objective) in models.items():
             metrics = {key: value/len(rows['val']) for key, value in totals[name].items()}
             print(json.dumps(dict(epoch=epoch+1, classifier=name, **metrics)), flush=True)
@@ -306,6 +325,7 @@ def train(args):
                 torch.save(dict(settings=model.settings, state_dict=model.state_dict(), metadata=manifest,
                     objective=objective, epoch=epoch+1, validation=metrics,
                     used_prompt_keys=sorted({r['prompt_key'] for rs in rows.values() for r in rs})), out/f'{name}.pt')
+                print(json.dumps(dict(event='classifier_checkpoint', epoch=epoch+1, classifier=name, path=str(out/f'{name}.pt'))), flush=True)
 
 
 def main():
@@ -333,14 +353,16 @@ def main():
             q.add_argument('--epochs', type=int, default=10)
             q.add_argument('--accumulate', type=int, default=16)
             q.add_argument('--lr', type=float, default=1e-4)
+            q.add_argument('--log-every', type=int, default=100)
+            q.add_argument('--log-seconds', type=float, default=30.)
     args = p.parse_args()
     if args.command == 'collect' and min(args.train_prompts, args.val_prompts, args.test_prompts,
         args.states_per_prompt, args.state_stride, args.timing_repeats) < 1:
         p.error('Collection limits must be positive')
     if args.command == 'collect' and args.max_new_tokens < max(K_VALUES)+1:
         p.error('Need max-new-tokens >= 33 for paired labels')
-    if args.command == 'train' and (args.epochs < 1 or args.accumulate < 1):
-        p.error('epochs and accumulate must be positive')
+    if args.command == 'train' and (args.epochs < 1 or args.accumulate < 1 or args.log_every < 1 or args.log_seconds <= 0):
+        p.error('epochs, accumulate and log limits must be positive')
     {'collect': collect, 'label': label, 'train': train}[args.command](args)
 
 
