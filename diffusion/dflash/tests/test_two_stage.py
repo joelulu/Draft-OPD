@@ -199,6 +199,8 @@ def test_complete_collect_label_train_and_dynamic_eval_on_tiny_models(tmp_path, 
     fixed_path=tmp_path/'forced.pt'
     torch.save(ckpt,fixed_path)
     args.classifier=[str(fixed_path)]
+    args.baseline_lengths=[16]
+    args.progress_json=str(tmp_path/'eval_progress.json')
     args.output=str(tmp_path/'forced_eval')
     pipeline.evaluate(args)
     forced=[json.loads(v) for v in (Path(args.output)/'results_rank000.jsonl').read_text().splitlines()]
@@ -206,6 +208,9 @@ def test_complete_collect_label_train_and_dynamic_eval_on_tiny_models(tmp_path, 
     selected=next(r for r in forced if r['mode']=='classifier_forced')
     assert fixed['actions']==selected['actions']
     assert fixed['accepted_tokens']==selected['accepted_tokens']
+    assert {r['mode'] for r in forced}=={'ar','fixed_16','classifier_forced'}
+    progress=json.loads(Path(args.progress_json).read_text())
+    assert progress['completed']==progress['total'] and progress['eta_s']==0
 
 
 def test_paired_labels_count_emitted_tokens_before_eos():

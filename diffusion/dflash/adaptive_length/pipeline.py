@@ -304,8 +304,11 @@ def evaluate(args):
             used.update(checkpoint['used_prompt_keys'])
         if any(key in used for key, _ in rows):
             raise ValueError("Evaluation prompts overlap classifier training/validation; use labeled/test_prompts.jsonl.")
-    widths = (list(args.lengths) if getattr(args, "exact_lengths", False) else
-              fixed_lengths(args.lengths, draft.block_size, args.fixed_lengths or []))
+    baseline_lengths = getattr(args, "baseline_lengths", None) or args.lengths
+    widths = (list(baseline_lengths) if getattr(args, "exact_lengths", False) else
+              fixed_lengths(baseline_lengths, draft.block_size, args.fixed_lengths or []))
+    if not widths or any(k < 1 or k > 32 for k in widths):
+        raise ValueError("Baseline lengths must be in [1,32]")
     modes = ["ar"] + [f"fixed_{k}" for k in widths] + (["adaptive"] if head else []) + list(classifiers)
     records = []
     outdir = Path(args.output)
@@ -318,12 +321,14 @@ def evaluate(args):
                     seed=args.seed, max_new_tokens=args.max_new_tokens,
                     classifiers={name: model.settings for name, model in classifiers.items()})
     (outdir / f"metadata_rank{rank:03d}.json").write_text(json.dumps(metadata, indent=2))
+    evaluation_start = time.monotonic()
     with torch.inference_mode():
         for key, prompt in rows:
             ids = encode(tokenizer, prompt, args, target.device)
             if args.warmup:
                 warm = RoundRuntime(target, draft, ids)
-                for k in widths:
+                warm_lengths = sorted(set(widths) | (set(args.lengths) if classifiers else set()))
+                for k in warm_lengths:
                     warm.propose(k)
                 for classifier in classifiers.values():
                     classifier.choose(warm)
@@ -405,6 +410,17 @@ def evaluate(args):
                 rec["mean_accepted"] = rec["accepted_tokens"]/len(spec) if spec else None
                 rec["mean_committed"] = rec["spec_committed_tokens"]/len(spec) if spec else None
                 records.append(rec)
+                if getattr(args, "progress_json", None):
+                    elapsed = time.monotonic()-evaluation_start
+                    total = len(rows)*len(modes)
+                    progress = dict(phase="evaluation", completed=len(records), total=total,
+                        elapsed_s=elapsed, eta_s=elapsed*(total-len(records))/len(records),
+                        mode=mode, updated_at=time.time())
+                    path = Path(args.progress_json)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = path.with_name(path.name+".tmp")
+                    temporary.write_text(json.dumps(progress, indent=2))
+                    temporary.replace(path)
                 print(json.dumps(rec), flush=True)
                 # Save each completed method so a later interruption preserves results.
                 with (outdir / f"rounds_rank{rank:03d}.jsonl").open("a") as stream:
@@ -546,6 +562,8 @@ def main():
             q.add_argument("--timing-repeats", type=int, default=2)
         if name == "eval":
             q.add_argument("--head")
+            q.add_argument("--baseline-lengths", type=int, nargs="+", help="Fixed baselines independent of classifier actions.")
+            q.add_argument("--progress-json", help="Atomic inference progress/ETA file.")
             q.add_argument("--classifier", nargs="+", help="Frozen KV classifiers; evaluated with all fixed-K baselines.")
             q.add_argument("--exact-lengths", action="store_true", help="Do not automatically add the native candidate count.")
             q.add_argument("--strict-match", action="store_true")

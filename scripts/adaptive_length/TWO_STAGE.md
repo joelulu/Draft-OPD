@@ -204,3 +204,115 @@ A process that already imported the older trainer will not acquire these logs
 by pulling files: they apply on the next launch. Do not restart a productive
 long-running job only to obtain progress logging; current inference/training
 checkpoints do not contain optimizer/epoch resume state for this trainer.
+
+## Resumable workflow and eight-GPU classifier trainer (v2)
+
+`run_fixed_vs_dynamic.sh` wraps both draft arms, exports, paired collection,
+classifier training, baseline/mixed evaluation and final comparison. It reuses
+existing exported drafts and complete labeled data. The v2 classifier output is
+`classifiers_ddp/`; older `classifiers/`, old logs and data are preserved.
+
+For an experiment already at the classifier stage:
+
+```bash
+export RESULT_ROOT="$PWD/runs/fixed_vs_dynamic_20261107_051744"
+CLASSIFIER_GPUS=0,1,2,3,4,5,6,7 HEAD_EPOCHS=10 \
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh resume
+```
+
+Stop the *original training command* in its own terminal with Ctrl+C and wait
+for its prompt to return before launching this command. Ctrl+C in `tail -f` only
+stops monitoring. The old trainer does not save optimizer/cursor resume states:
+its unfinished classifier training must restart. Both exported drafts and all
+28,196/3,407/3,511 collected train/val/test states remain reusable. The script
+never kills unrelated Python/Ray jobs. A per-experiment file lock prevents two
+v2 workflow controllers from using the same root simultaneously; it cannot
+identify a previously launched legacy command, so stop that command first.
+
+Other entrypoints:
+
+```bash
+# Whole new experiment; specify a fresh RESULT_ROOT or let the script create one.
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh all
+
+# Only train/resume classifiers, without following inference evaluation.
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh classifiers
+
+# Evaluate already trained v2 classifier weights.
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh eval
+
+# Read live state/loss/ETA without importing torch or allocating GPU memory.
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh status
+```
+
+`resume` reuses exported draft files and complete labeled files. A partial old
+collection is archived before recollection. Native draft training itself still
+uses its existing checkpoint/restart behavior, not the new classifier resume
+mechanism. Previous evaluation folders are archived before reevaluation. The
+workflow fails at any failed stage; it does not proceed to evaluate an unfinished
+classifier. Every run preserves the existing fixed-vs-dynamic baseline definition.
+
+### Parallelism and batching
+
+Each GPU holds a frozen target plus all four small classifiers. Complete prompt
+trajectories are partitioned by state count so target KV is incrementally reused
+within each GPU. The four classifiers use ordinary DDP gradients. A small number
+of padded tail states are zero-loss and excluded from loss/validation statistics;
+all ranks execute equal training iterations. Gradient normalization corrects for
+both padding and partial accumulation batches. Validation also handles unequal
+shards without duplicating states.
+
+By default, global batch remains 16: eight GPUs accumulate two states each. This
+preserves the previous global batch size rather than increasing it eightfold.
+Set `CLASSIFIER_GLOBAL_BATCH=16` and `CLASSIFIER_GPUS=...`; NPROC is inferred from
+the visible list. The batch must be divisible by NPROC. One/four/eight GPUs are
+supported; there is no promise of an eightfold speedup. Resume requires the same
+world size, accumulation, seed, LR, frozen weights and labeled data; to change
+those, choose a fresh `CLASSIFIER_DIR` instead.
+
+### Progress and resuming
+
+The v2 trainer emits globally reduced four-model training losses approximately
+every 15 seconds or 50 optimizer updates, at update boundaries. It prints epoch,
+global processed states, state rate and estimated remaining classifier time.
+Validation prints loss/accuracy/speed-ratio as well as progress. The initial ETA
+estimates validation from the training rate; it becomes better informed after
+the first validation. It excludes model loading and later inference evaluation.
+Inference has a separate progress/ETA file.
+
+- `classifiers_ddp.log`: live training output, appended on resume.
+- `classifiers_ddp/progress.json`: atomic latest status and latest four losses.
+- `classifiers_ddp/training_state.pt`: all four current models, AdamW states,
+  epoch and next local state cursor, best validation values and data fingerprint.
+- `classifiers_ddp/{full_kv,window_16}_{accept,speed}.pt`: best inference models.
+- `evaluation/{baseline,mixed}/progress.json`: inference progress and ETA.
+- `final_comparison.csv`: fixed-trained/fixed16, mixed-trained/fixed16, and the
+  four mixed-trained dynamic classifiers, on identical test prompts.
+
+Resume checkpoints are saved atomically every 100 optimizer updates and at
+training/validation boundaries. Stopping between checkpoints loses only work
+since the latest checkpoint; the next `resume` restores AdamW and reconstructs
+KV starting at the remaining states. An interrupted validation is rerun. This is
+not a resume from the older best-inference-only classifier files.
+
+Set `CLASSIFIER_LOG_SECONDS`, `CLASSIFIER_LOG_EVERY`, `CLASSIFIER_SAVE_EVERY`,
+`HEAD_EPOCHS`, `EVAL_SAMPLES`, and `EVAL_MAX_NEW_TOKENS` as needed. Default evaluation
+keeps only fixed16 plus the four dynamic predictors (and AR for match recording);
+the eight action lengths remain available to every dynamic predictor.
+
+### Tests
+
+```bash
+PYTHONPATH=diffusion/dflash python -m pytest -q \
+  diffusion/dflash/tests/test_ddp_classifiers.py \
+  diffusion/dflash/tests/test_workflow_tools.py
+```
+
+The distributed regression uses two CPU/Gloo processes, unequal prompt shards,
+all four classifiers and an actual mid-epoch optimizer-state save/resume. It
+compares the final weights and AdamW tensors with uninterrupted training. In a
+socket-disabled local sandbox it can use the explicitly test-only synchronous
+FileStore backend via `KV_CLASSIFIER_TEST_BACKEND=file_test`; that still exercises
+real DDP reducers across separate processes but does not test Gloo/NCCL transport.
+Normal server tests default to Gloo; production training always uses CUDA/NCCL.
+Real eight-GPU performance and NCCL operation must be checked on the server.
