@@ -29,7 +29,7 @@ def dataset():
     return rows
 
 
-def worker(rank,world,root,store):
+def worker(rank,world,root,store,reader):
     torch.set_num_threads(1)
     backend=os.getenv('KV_CLASSIFIER_TEST_BACKEND','gloo')
     if backend=='file_test':
@@ -43,15 +43,26 @@ def worker(rank,world,root,store):
             max_position_embeddings=128,attn_implementation='sdpa')).eval().requires_grad_(False)
         args=SimpleNamespace(output=str(Path(root)/'full'),resume=False,data_sha256='fixture',seed=42,
             accumulate=2,lr=.001,epochs=2,log_every=1,log_seconds=1.,save_every=1)
+        args.reader=reader
+        draft=None
+        if reader=='dflash':
+            from model.dflash import DFlashDraftModel
+            dc=Qwen3Config(**target.config.to_dict())
+            dc.num_target_layers=1
+            dc.block_size=16
+            dc.layer_types=['full_attention']
+            dc.dflash_config=dict(target_layer_ids=[0],mask_token_id=30)
+            dc._attn_implementation='sdpa'
+            draft=DFlashDraftModel(dc).eval().requires_grad_(False)
         manifest=dict(target='tiny',draft='tiny')
         rows=dataset()
-        train_models(args,target,manifest,rows,rank,world)
+        train_models(args,target,manifest,rows,rank,world,draft=draft)
         dist.barrier()
         args.output=str(Path(root)/'resumed')
-        train_models(args,target,manifest,rows,rank,world,stop_after_updates=1)
+        train_models(args,target,manifest,rows,rank,world,stop_after_updates=1,draft=draft)
         dist.barrier()
         args.resume=True
-        train_models(args,target,manifest,rows,rank,world)
+        train_models(args,target,manifest,rows,rank,world,draft=draft)
         assert all(p.grad is None for p in target.parameters())
         dist.barrier()
     finally:
@@ -67,8 +78,9 @@ def test_whole_prompts_balanced_without_duplicates():
     assert partition_prompts(rows,2,42)==parts
 
 
-def test_two_rank_resume_matches_uninterrupted_weights_and_optimizer(tmp_path):
-    mp.spawn(worker,args=(2,str(tmp_path),str(tmp_path/'store')),nprocs=2,join=True)
+@pytest.mark.parametrize('reader',['legacy','dflash'])
+def test_two_rank_resume_matches_uninterrupted_weights_and_optimizer(tmp_path,reader):
+    mp.spawn(worker,args=(2,str(tmp_path),str(tmp_path/'store'),reader),nprocs=2,join=True)
     full=torch.load(tmp_path/'full/training_state.pt',weights_only=True)
     resumed=torch.load(tmp_path/'resumed/training_state.pt',weights_only=True)
     assert full['next_epoch']==resumed['next_epoch']==2

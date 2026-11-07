@@ -64,8 +64,9 @@ if [[ "$STAGE" == train-classifiers || "$STAGE" == classifier-smoke ]]; then
 fi
 if [[ "$STAGE" == eval || "$STAGE" == eval-smoke ]]; then
     if [[ "$STAGE" == eval-smoke ]]; then export EVAL_SAMPLES=4 MAX_NEW_TOKENS=128; fi
-    CHECKPOINTS=("$RESULT_ROOT/classifiers/full_kv_accept.pt" "$RESULT_ROOT/classifiers/full_kv_speed.pt"
-                 "$RESULT_ROOT/classifiers/window_16_accept.pt" "$RESULT_ROOT/classifiers/window_16_speed.pt")
+    CLASSIFIER_DIR=${CLASSIFIER_DIR:-$RESULT_ROOT/classifiers}
+    CHECKPOINTS=("$CLASSIFIER_DIR/full_kv_accept.pt" "$CLASSIFIER_DIR/full_kv_speed.pt"
+                 "$CLASSIFIER_DIR/window_16_accept.pt" "$CLASSIFIER_DIR/window_16_speed.pt")
     for path in "${CHECKPOINTS[@]}"; do test -f "$path"; done
     EVAL_DIR="$RESULT_ROOT/eval_$(date +%Y%m%d_%H%M%S)"
     "$PYTHON_BIN" -m adaptive_length.pipeline eval "${COMMON[@]}" \

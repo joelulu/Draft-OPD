@@ -37,6 +37,8 @@ def status(root,classifiers):
     progress=classifiers/'progress.json'
     if progress.exists():
         row=json.loads(progress.read_text())
+        if 'reader_schema' in row:
+            print(f"Reader: {row['reader_schema']}")
         print(f"Classifier phase: {row['phase']}; epoch {row.get('epoch','?')}/{row.get('epochs','?')}; GPUs {row.get('world_size','?')}")
         if 'states' in row:
             print(f"States: {row['states']}/{row['total_states']} ({row.get('percent',0):.2f}%)")
@@ -44,10 +46,20 @@ def status(root,classifiers):
             print(f"Overall training states: {row['overall_train_percent']:.2f}%")
         print(f"Remaining classifier training + validation: {duration(row.get('eta_s'))}")
         print(f"Last report age: {duration(time.time()-row.get('updated_at',time.time()))}")
+        if row.get('majority_accuracy',{}).get('val'):
+            majority=row['majority_accuracy']['val']
+            print('Val majority-class baseline: '+', '.join(f'{k}={v:.3%}' for k,v in majority.items()))
         for name,loss in (row.get('train_loss') or row.get('last_train_loss',{})).items():
-            print(f'  train {name}: loss={loss:.6f}')
+            accuracy=(row.get('train_accuracy') or row.get('last_train_accuracy',{})).get(name)
+            extra=f', accuracy={accuracy:.3%}' if accuracy is not None else ''
+            print(f'  train {name}: loss={loss:.6f}{extra}')
         for name,metrics in (row.get('validation') or row.get('last_validation',{})).items():
-            print(f"  val {name}: loss={metrics['loss']:.6f}, accuracy={metrics['accuracy']:.3%}")
+            counts=metrics.get('predicted_k_counts',{})
+            extra=''
+            if counts and sum(counts.values()):
+                best=max(counts,key=counts.get)
+                extra=f", most selected K={best} ({counts[best]/sum(counts.values()):.1%})"
+            print(f"  val {name}: loss={metrics['loss']:.6f}, accuracy={metrics['accuracy']:.3%}{extra}")
         if (classifiers/'training_state.pt').exists():
             print(f'Resume checkpoint: {classifiers/"training_state.pt"}')
     else:

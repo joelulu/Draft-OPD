@@ -316,3 +316,88 @@ FileStore backend via `KV_CLASSIFIER_TEST_BACKEND=file_test`; that still exercis
 real DDP reducers across separate processes but does not test Gloo/NCCL transport.
 Normal server tests default to Gloo; production training always uses CUDA/NCCL.
 Real eight-GPU performance and NCCL operation must be checked on the server.
+
+## DFlash-aligned selector features
+
+Set `CLASSIFIER_READER=dflash` in `run_fixed_vs_dynamic.sh` to train the corrected
+reader. The default remains `legacy` so old predictor checkpoints and running
+experiments remain readable. Native predictors are stored separately under
+`classifiers_dflash/`, with log `classifiers_dflash.log`. Do not resume a legacy
+optimizer checkpoint into the native architecture.
+
+The corrected reader calls the **original frozen first DFlash decoder layer**:
+
+- Q: anchor embedding -> original `input_layernorm`, `q_proj`, `q_norm`, RoPE.
+- Context K/V: the draft's original selected target hidden fusion `fc` and
+  `hidden_norm`, original `k_proj`, `v_proj`, `k_norm`, and K RoPE.
+- Attention: original backend/GQA/head correspondence/scaling, followed by the
+  original `o_proj`, residuals, post-attention norm and MLP. No new Q/K/V weights,
+  per-head averaging or cross-layer averaging are introduced.
+- Visibility: `full_kv` means historical context in **draft layer 0**, respecting
+  its configured sliding window. `window_16` retains the last 16 historical
+  positions of that same cache. Both include anchor self-KV and preserve the
+  original absolute RoPE coordinates.
+
+This is **anchor-only, K-independent feature extraction**. There are no future
+MASK tokens in the feature probe. A full native K>0 block has extra MASK keys;
+its attention outputs and later-layer queries depend on K. The new feature is
+not claimed to equal a full speculative block's output. It exactly matches an
+original layer-0 anchor-only forward with the same visible context.
+
+Only a LayerNorm + MLP eight-class head trains; the target and draft, including
+all native attention projections, remain frozen. Separate heads still use the
+acceptance and speed labels. Same frozen weights/prefix/anchor means all existing
+paired state measurements and labels remain reusable. No stage-1 retraining or
+label recollection is required.
+
+At inference, pending confirmed context is projected into the **actual draft
+cache** before reading. Proposal generation reuses that filled cache; the read
+adds anchor self-KV through a temporary non-mutating adapter and never commits
+anchor/MASK tokens or changes the target cache. Selector wall time includes this
+cache preparation (which would otherwise run inside proposal generation), so it
+is not purely extra predictor overhead; total decode throughput is the primary
+comparison.
+
+Training prints majority-class baselines for both objectives, globally averaged
+train loss **and train accuracy**, and validation prediction histograms. Live
+status also displays the most frequently selected K. This distinguishes failure
+to fit training states from generalization and single-class collapse.
+
+Optional small TRAIN-only fitting probe (one GPU):
+
+```bash
+export RESULT_ROOT="$PWD/runs/fixed_vs_dynamic_20261107_051744"
+CLASSIFIER_READER=dflash EVAL_GPU=7 PROBE_SAMPLES=128 PROBE_STEPS=1000 \
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh probe
+```
+
+The probe caches native features for 128 randomly selected training states,
+fits four small heads and reports same-subset CE/accuracy. It writes only a
+`diagnostics/native_reader_probe_TIMESTAMP.json` report; it never replaces
+inference checkpoints or reports held-out accuracy. It is a trainability
+check, not evidence of useful throughput or generalization.
+
+Train native heads using eight GPUs and then evaluate only 16 test prompts:
+
+```bash
+CLASSIFIER_READER=dflash CLASSIFIER_GPUS=0,1,2,3,4,5,6,7 \
+HEAD_EPOCHS=10 EVAL_SAMPLES=16 EVAL_MAX_NEW_TOKENS=512 \
+bash scripts/adaptive_length/run_fixed_vs_dynamic.sh resume
+```
+
+For live monitoring use the same reader selection:
+
+```bash
+CLASSIFIER_READER=dflash bash scripts/adaptive_length/run_fixed_vs_dynamic.sh status
+```
+
+The workflow now defaults to 16 inference prompts; larger benchmarks require an
+explicit EVAL_SAMPLES override. Older evaluation directories and final CSV/text
+reports are archived before replacement. Keep any currently running workflow
+stopped or completed before updating/restarting against the same experiment root.
+
+Native-feature tests compare the actual first-layer outputs and all context KV
+layers with original DFlash code, check cache immutability and unchanged generation,
+verify consistent RoPE/GQA, train/save/load the small head, and exercise both
+native and legacy backends through two-process DDP mid-epoch resume. Local CPU
+checks do not substitute for testing BF16/CUDA numerics or real NCCL performance.

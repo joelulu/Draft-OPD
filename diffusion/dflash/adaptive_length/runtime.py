@@ -31,6 +31,17 @@ class RoundRuntime:
         anchor = self.target.get_input_embeddings()(self.anchor[:, 0])
         return pivot.float(), anchor.float()
 
+    def dflash_length_features(self, context_mode):
+        from .two_stage.dflash_features import materialize_context, read_anchor
+        start = self.prefix.shape[1]
+        cached = self.draft_cache.get_seq_length()
+        if cached < self.context_start or cached > start:
+            raise RuntimeError("Native selector context is not aligned with the confirmed prefix")
+        pending = self.context[:, cached-self.context_start:]
+        materialize_context(self.draft, self.draft_cache, pending, cached)
+        embedding = self.target.get_input_embeddings()(self.anchor)
+        return read_anchor(self.draft, self.draft_cache, embedding, start, context_mode)
+
     def propose(self, k, *, return_logits=False, forward_model=None):
         if not 1 <= k <= 32:
             raise ValueError("k excludes anchor and must be in [1,32].")

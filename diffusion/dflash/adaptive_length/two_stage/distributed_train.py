@@ -1,5 +1,6 @@
 """Equal-step DDP training of four KV classifiers with exact state accounting."""
 import argparse
+from collections import Counter
 from contextlib import nullcontext
 from datetime import timedelta
 import hashlib
@@ -15,7 +16,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from . import K_VALUES
-from .classifier import KVClassifier
+from .classifier import KVClassifier, DFlashLengthClassifier
 from .cli import iter_states, load_models, model_identity
 
 
@@ -64,14 +65,26 @@ def log_due(rank, world, device, due):
     return bool(flag.item())
 
 
-def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updates=None):
+def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updates=None, draft=None):
     """Dependency injection allows real tiny CPU/Gloo end-to-end tests."""
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     device = target.device
     config = target.config
+    native_reader = getattr(args, 'reader', 'legacy') == 'dflash'
+    if native_reader and draft is None:
+        raise ValueError('DFlash-aligned features require the frozen draft checkpoint')
+    if native_reader:
+        from .dflash_features import iter_dflash_states, FEATURE_SCHEMA
+    def states_iterator(subset):
+        return iter_dflash_states(target,draft,subset) if native_reader else iter_states(target,subset)
+    def classifier_input(model,features):
+        unwrapped=model.module if isinstance(model,DDP) else model
+        return features[unwrapped.context_mode] if native_reader else features
     identity = dict(manifest=manifest, data_sha256=args.data_sha256, world_size=world,
                     seed=args.seed, accumulate=args.accumulate, lr=args.lr)
+    if native_reader:
+        identity['reader_schema']=FEATURE_SCHEMA
     saved_path = out/'training_state.pt'
     saved = torch.load(saved_path, map_location='cpu', weights_only=True) if args.resume and saved_path.exists() else None
     if saved and saved['identity'] != identity:
@@ -87,10 +100,13 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
         for objective in ('accept', 'speed'):
             name = f'{context}_{objective}'
             torch.manual_seed(args.seed)
-            model = KVClassifier(anchor_dim=config.hidden_size,
-                head_dim=getattr(config,'head_dim',config.hidden_size//config.num_attention_heads),
-                layers=config.num_hidden_layers,kv_heads=config.num_key_value_heads,
-                context_mode=context).to(device)
+            if native_reader:
+                model = DFlashLengthClassifier(feature_dim=draft.config.hidden_size,context_mode=context).to(device)
+            else:
+                model = KVClassifier(anchor_dim=config.hidden_size,
+                    head_dim=getattr(config,'head_dim',config.hidden_size//config.num_attention_heads),
+                    layers=config.num_hidden_layers,kv_heads=config.num_key_value_heads,
+                    context_mode=context).to(device)
             if saved:
                 model.load_state_dict(saved['models'][name])
             models[name] = DDP(model, device_ids=[device.index] if device.type=='cuda' else None,
@@ -112,17 +128,22 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
     last_log=0.
     latest_losses=saved.get('latest_losses',{}) if saved else {}
     latest_validation=saved.get('latest_validation',{}) if saved else {}
+    latest_train_accuracy=saved.get('latest_train_accuracy',{}) if saved else {}
 
     def emit(record):
-        nonlocal last_log,latest_losses,latest_validation
+        nonlocal last_log,latest_losses,latest_validation,latest_train_accuracy
         if rank:
             return
         if 'train_loss' in record:
             latest_losses=record['train_loss']
         if 'validation' in record:
             latest_validation=record['validation']
-        record.update(last_train_loss=latest_losses,last_validation=latest_validation)
-        record.update(world_size=world,epochs=args.epochs,global_batch=world*args.accumulate,optimizer_updates=updates,
+        if 'train_accuracy' in record:
+            latest_train_accuracy=record['train_accuracy']
+        record.update(last_train_loss=latest_losses,last_validation=latest_validation,last_train_accuracy=latest_train_accuracy)
+        record.update(majority_accuracy=majority_accuracy,
+                      reader_schema=FEATURE_SCHEMA if native_reader else "legacy_target_kv",
+                      world_size=world,epochs=args.epochs,global_batch=world*args.accumulate,optimizer_updates=updates,
                       run_elapsed_s=round(time.monotonic()-started,2),updated_at=time.time())
         print(json.dumps(record),flush=True)
         atomic_json(record,out/'progress.json')
@@ -133,12 +154,18 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
             return
         atomic_save(dict(schema=2,identity=identity,next_epoch=next_epoch,next_position=next_position,
             updates=updates,best=best,durations=durations,latest_losses=latest_losses,latest_validation=latest_validation,
+            latest_train_accuracy=latest_train_accuracy,
             models={name:base(m).state_dict() for name,m in models.items()},
             optimizers={name:opt.state_dict() for name,opt in optimizers.items()}),saved_path)
         print(json.dumps(dict(event='classifier_resume_checkpoint',epoch=next_epoch+1,
             next_local_state=next_position,optimizer_updates=updates,path=str(saved_path))),flush=True)
 
+    label_counts={split:{objective:dict(Counter(r[f'label_{objective}_k'] for r in records))
+        for objective in ('accept','speed')} for split,records in rows.items()}
+    majority_accuracy={split:{objective:max(counts.values())/len(rows[split])
+        for objective,counts in by_objective.items()} for split,by_objective in label_counts.items()}
     emit(dict(event='classifier_start',phase='setup',train_states=ntrain,val_states=nval,
+        label_counts=label_counts,majority_accuracy=majority_accuracy,
         train_prompts=len({r['prompt_key'] for r in rows['train']}),
         resumed=bool(saved),epoch=start_epoch+1,next_local_state=resume_position,
         global_batch=world*args.accumulate))
@@ -157,14 +184,14 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
         if cursor>maxsteps or (cursor%args.accumulate and cursor!=maxsteps):
             raise ValueError('Invalid checkpoint cursor: expected an optimizer update boundary')
         local_rows=parts[rank]
-        iterator=iter(iter_states(target,local_rows[cursor:]))
+        iterator=iter(states_iterator(local_rows[cursor:]))
         fallback=None
         phase_start=time.monotonic()
         prior_states=sum(min(cursor,n) for n in lengths)
         # Model KV is reconstructed only for remaining states on resume.
         emit(dict(event='classifier_progress',phase='train',epoch=epoch+1,states=prior_states,
                   total_states=ntrain,percent=100*prior_states/ntrain,eta_s=None))
-        window=torch.zeros(len(models)+1,device=device)
+        window=torch.zeros(2*len(models)+1,device=device)
         active_in_update=0
         for m in models.values():
             m.train()
@@ -174,7 +201,7 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
                 row,pairs,anchor=next(iterator)
                 fallback=(row,pairs,anchor)
             elif fallback is None:
-                fallback=next(iter(iter_states(target,[rows['train'][0]])))
+                fallback=next(iter(states_iterator([rows['train'][0]])))
                 row,pairs,anchor=fallback
             else:
                 row,pairs,anchor=fallback
@@ -183,11 +210,13 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
                 sync=model.no_sync() if isinstance(model,DDP) and not boundary else nullcontext()
                 with sync:
                     label=K_VALUES.index(row[f'label_{objectives[name]}_k'])
-                    ce=torch.nn.functional.cross_entropy(model(pairs,anchor),torch.tensor([label],device=device))
+                    logits=model(classifier_input(model,pairs),anchor)
+                    ce=torch.nn.functional.cross_entropy(logits,torch.tensor([label],device=device))
                     loss=ce*(float(active)/args.accumulate)
                     loss.backward()
                 if active:
                     window[j]+=ce.detach()
+                    window[len(models)+j]+=(logits.detach().argmax(-1)==label).sum()
             if active:
                 window[-1]+=1
                 active_in_update+=1
@@ -220,6 +249,7 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
                     states_per_s=round(rate,3),eta_s=round(eta) if eta is not None else None,
                     eta_scope='remaining classifier training and validation; excludes evaluation',
                     train_loss={name:values[j]/max(values[-1],1) for j,name in enumerate(models)},
+                    train_accuracy={name:values[len(models)+j]/max(values[-1],1) for j,name in enumerate(models)},
                     per_rank_states=lengths))
                 window.zero_()
             if updates%args.save_every==0 or i+1==maxsteps:
@@ -232,8 +262,9 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
             durations['train']=ntrain/max(1,ntrain-prior_states)*(time.monotonic()-phase_start)
         val_start=time.monotonic()
         emit(dict(event='classifier_progress',phase='validation',epoch=epoch+1,states=0,total_states=nval,eta_s=None))
-        iterator=iter(iter_states(target,val_parts[rank]))
+        iterator=iter(states_iterator(val_parts[rank]))
         totals=torch.zeros((len(models),4),device=device)
+        predictions=torch.zeros((len(models),len(K_VALUES)),device=device)
         for model in models.values():
             model.eval()
         with torch.no_grad():
@@ -241,9 +272,10 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
                 if i<len(val_parts[rank]):
                     row,pairs,anchor=next(iterator)
                     for j,(name,model) in enumerate(models.items()):
-                        logits=base(model)(pairs,anchor)  # no DDP collectives on uneven validation shards
+                        logits=base(model)(classifier_input(model,pairs),anchor)  # no DDP collectives on uneven validation shards
                         label=K_VALUES.index(row[f'label_{objectives[name]}_k'])
                         prediction=logits.argmax(-1)
+                        predictions[j].index_add_(0,prediction,torch.ones_like(prediction,dtype=predictions.dtype))
                         scores=torch.tensor(row['speed_scores'],device=device)
                         totals[j,0]+=torch.nn.functional.cross_entropy(logits,torch.tensor([label],device=device))
                         totals[j,1]+=(prediction==label).sum()
@@ -253,20 +285,24 @@ def train_models(args, target, manifest, rows, rank=0, world=1, stop_after_updat
                     due=time.monotonic()-last_log>=args.log_seconds or i+1==maxval
                     if log_due(rank,world,device,due):
                         values=tensor_sum(totals.clone(),world).tolist()
+                        predicted=tensor_sum(predictions.clone(),world).tolist()
                         done=int(values[0][3])
                         rate=done/max(time.monotonic()-val_start,1e-9)
                         remaining_train=(args.epochs-epoch-1)*durations.get('train',0)
                         eta=(nval-done)/rate+(args.epochs-epoch-1)*nval/rate+remaining_train
                         emit(dict(event='classifier_progress',phase='validation',epoch=epoch+1,
                             states=done,total_states=nval,percent=round(100*done/nval,2),eta_s=round(eta),
-                            validation={name:dict(loss=v[0]/v[3],accuracy=v[1]/v[3],speed_ratio=v[2]/v[3])
-                                for name,v in zip(models,values)}))
+                            validation={name:dict(loss=v[0]/v[3],accuracy=v[1]/v[3],speed_ratio=v[2]/v[3],
+                                predicted_k_counts={str(k):int(c) for k,c in zip(K_VALUES,hist)})
+                                for name,v,hist in zip(models,values,predicted)}))
         values=tensor_sum(totals,world).tolist()
+        predicted=tensor_sum(predictions,world).tolist()
         durations['val']=time.monotonic()-val_start
-        for (name,model),v in zip(models.items(),values):
+        for (name,model),v,hist in zip(models.items(),values,predicted):
             if int(v[3])!=nval:
                 raise RuntimeError('Validation duplicated or lost states')
-            metrics=dict(loss=v[0]/v[3],accuracy=v[1]/v[3],speed_ratio=v[2]/v[3])
+            metrics=dict(loss=v[0]/v[3],accuracy=v[1]/v[3],speed_ratio=v[2]/v[3],
+                predicted_k_counts={str(k):int(c) for k,c in zip(K_VALUES,hist)})
             if rank==0:
                 print(json.dumps(dict(event='classifier_validation',epoch=epoch+1,classifier=name,**metrics)),flush=True)
             if metrics['loss']<best[name]:
@@ -293,6 +329,7 @@ def main():
     p.add_argument('--log-seconds',type=float,default=15)
     p.add_argument('--save-every',type=int,default=100,help='Optimizer updates between resume checkpoints')
     p.add_argument('--resume',action='store_true')
+    p.add_argument('--reader',choices=['legacy','dflash'],default='legacy')
     args=p.parse_args()
     if min(args.epochs,args.accumulate,args.log_every,args.log_seconds,args.save_every)<1:
         p.error('Training/log/checkpoint limits must be positive')
@@ -332,8 +369,8 @@ def main():
             print(json.dumps(dict(event='classifier_setup',phase='loading_frozen_target',
                 train_states=len(rows['train']),val_states=len(rows['val']),world_size=world,
                 global_batch=world*args.accumulate)),flush=True)
-        target,_=load_models(args,draft=False)
-        train_models(args,target,manifest,rows,rank,world)
+        target,draft=load_models(args,draft=args.reader=='dflash')
+        train_models(args,target,manifest,rows,rank,world,draft=draft)
     finally:
         if world>1:
             dist.destroy_process_group()

@@ -284,7 +284,7 @@ def evaluate(args):
     if getattr(args, "classifier", None):
         if args.head or args.enable_thinking:
             raise ValueError("KV classifiers use no-thinking collection and cannot be combined with the old head.")
-        from .two_stage.classifier import KVClassifier
+        from .two_stage.classifier import build_classifier
         from .two_stage.cli import model_identity
         from .two_stage import K_VALUES
         if tuple(args.lengths) != K_VALUES:
@@ -295,7 +295,7 @@ def evaluate(args):
             checkpoint = torch.load(path, map_location="cpu", weights_only=True)
             if checkpoint['metadata']['target'] != target_id or checkpoint['metadata']['draft'] != draft_id:
                 raise ValueError("Classifier frozen-model fingerprints differ from evaluation weights.")
-            classifier = KVClassifier(**checkpoint['settings']).to(target.device).eval()
+            classifier = build_classifier(checkpoint['settings']).to(target.device).eval()
             classifier.load_state_dict(checkpoint['state_dict'])
             name = f"classifier_{Path(path).stem}"
             if name in classifiers:

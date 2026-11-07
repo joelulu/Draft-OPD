@@ -5,7 +5,7 @@ export PYTHONUNBUFFERED=1
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 MODE=${1:-all}
-case "$MODE" in all|resume|classifiers|eval|status) ;; *) echo 'usage: run_fixed_vs_dynamic.sh all|resume|classifiers|eval|status' >&2; exit 2 ;; esac
+case "$MODE" in all|resume|classifiers|eval|probe|status) ;; *) echo 'usage: run_fixed_vs_dynamic.sh all|resume|classifiers|eval|probe|status' >&2; exit 2 ;; esac
 if [[ -z ${PYTHON_BIN:-} ]]; then
     if [[ -f .venv-draftopd/bin/activate ]]; then source .venv-draftopd/bin/activate; else source ../.venv-draftopd/bin/activate; fi
     PYTHON_BIN=$(command -v python)
@@ -15,7 +15,15 @@ if [[ -z ${RESULT_ROOT:-} ]]; then
     export RESULT_ROOT="$ROOT/runs/fixed_vs_dynamic_$(date +%Y%m%d_%H%M%S)"
 fi
 export RESULT_ROOT=$("$PYTHON_BIN" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$RESULT_ROOT")
-CLASSIFIER_DIR=${CLASSIFIER_DIR:-$RESULT_ROOT/classifiers_ddp}
+CLASSIFIER_READER=${CLASSIFIER_READER:-legacy}
+case "$CLASSIFIER_READER" in
+legacy) DEFAULT_CLASSIFIER_DIR="$RESULT_ROOT/classifiers_ddp" ;;
+dflash) DEFAULT_CLASSIFIER_DIR="$RESULT_ROOT/classifiers_dflash" ;;
+*) echo 'CLASSIFIER_READER must be legacy or dflash' >&2; exit 2 ;;
+esac
+CLASSIFIER_DIR=${CLASSIFIER_DIR:-$DEFAULT_CLASSIFIER_DIR}
+CLASSIFIER_LOG="$RESULT_ROOT/classifiers_ddp.log"
+if [[ "$CLASSIFIER_READER" == dflash ]]; then CLASSIFIER_LOG="$RESULT_ROOT/classifiers_dflash.log"; fi
 if [[ "$MODE" == status ]]; then
     exec "$PYTHON_BIN" scripts/adaptive_length/workflow_tools.py status --root "$RESULT_ROOT" --classifiers "$CLASSIFIER_DIR"
 fi
@@ -90,6 +98,15 @@ if [[ "$MODE" == all || "$MODE" == resume ]]; then
 fi
 for MODEL in fixed mixed; do test -f "$RESULT_ROOT/models/$MODEL/config.json"; done
 for FILE in train.jsonl val.jsonl test_prompts.jsonl manifest.json; do test -f "$RESULT_ROOT/labeled/$FILE"; done
+if [[ "$MODE" == probe ]]; then
+    mark native_reader_probe
+    CUDA_VISIBLE_DEVICES="${EVAL_GPU:-7}" "$PYTHON_BIN" -m adaptive_length.two_stage.reader_probe \
+        --target "$MAIN_MODEL_PATH" --draft "$RESULT_ROOT/models/mixed" --data "$RESULT_ROOT/labeled" \
+        --output "$RESULT_ROOT/diagnostics/native_reader_probe_$STAMP.json" \
+        --samples "${PROBE_SAMPLES:-128}" --steps "${PROBE_STEPS:-1000}" \
+        2>&1 | tee "$RESULT_ROOT/native_reader_probe_$STAMP.log"
+    exit 0
+fi
 if [[ "$MODE" != eval ]]; then
     mark classifiers
     LAUNCH=("$PYTHON_BIN")
@@ -100,8 +117,8 @@ if [[ "$MODE" != eval ]]; then
         --data "$RESULT_ROOT/labeled" --output "$CLASSIFIER_DIR" \
         --epochs "${HEAD_EPOCHS:-10}" --accumulate "$ACCUMULATE" --lr "${CLASSIFIER_LR:-1e-4}" \
         --log-every "${CLASSIFIER_LOG_EVERY:-50}" --log-seconds "${CLASSIFIER_LOG_SECONDS:-15}" \
-        --save-every "${CLASSIFIER_SAVE_EVERY:-100}" --resume \
-        2>&1 | tee -a "$RESULT_ROOT/classifiers_ddp.log"
+        --save-every "${CLASSIFIER_SAVE_EVERY:-100}" --reader "$CLASSIFIER_READER" --resume \
+        2>&1 | tee -a "$CLASSIFIER_LOG"
     if [[ "$MODE" == classifiers ]]; then exit 0; fi
 fi
 CHECKPOINTS=("$CLASSIFIER_DIR/full_kv_accept.pt" "$CLASSIFIER_DIR/full_kv_speed.pt" "$CLASSIFIER_DIR/window_16_accept.pt" "$CLASSIFIER_DIR/window_16_speed.pt")
@@ -120,12 +137,15 @@ for ARM in baseline mixed; do
     fi
     CUDA_VISIBLE_DEVICES="${EVAL_GPU:-7}" "$PYTHON_BIN" -m adaptive_length.pipeline eval \
         --target "$MAIN_MODEL_PATH" --draft "$MODEL" --data "$EVAL_DATA" --output "$OUT" \
-        --split all --max-samples "${EVAL_SAMPLES:-256}" --max-prompt "${MAX_PROMPT:-512}" \
+        --split all --max-samples "${EVAL_SAMPLES:-16}" --max-prompt "${MAX_PROMPT:-512}" \
         --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-512}" --seed 42 \
         --lengths 4 8 12 16 20 24 28 32 --baseline-lengths 16 --exact-lengths \
         --progress-json "$OUT/progress.json" "${FLAGS[@]}" \
         2>&1 | tee "$RESULT_ROOT/evaluation_${ARM}_${STAMP}.log"
 done
 mark summarize
+for FILE in final_comparison.csv final_comparison.txt; do
+    if [[ -f "$RESULT_ROOT/$FILE" ]]; then cp "$RESULT_ROOT/$FILE" "$RESULT_ROOT/${FILE%.*}_previous_$STAMP.${FILE##*.}"; fi
+done
 "$PYTHON_BIN" scripts/adaptive_length/workflow_tools.py summarize --root "$RESULT_ROOT" | tee "$RESULT_ROOT/final_comparison.txt"
 echo "Complete: $RESULT_ROOT/final_comparison.csv"
