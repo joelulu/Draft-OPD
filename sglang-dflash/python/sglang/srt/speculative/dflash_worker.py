@@ -1,5 +1,6 @@
 import logging
 import math
+import random
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -168,6 +169,16 @@ class DFlashWorker:
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._candidate_lengths = tuple(server_args.speculative_dflash_candidate_lengths or [])
+        if self._candidate_lengths:
+            if tuple(sorted(set(self._candidate_lengths))) != self._candidate_lengths or any(k < 1 or k > 32 for k in self._candidate_lengths):
+                raise ValueError("DFLASH candidate lengths must be unique increasing values in [1,32].")
+            if not server_args.disable_cuda_graph or not server_args.disable_overlap_schedule:
+                raise ValueError("Variable-width OPD requires eager, non-overlap spec-v1 scheduling.")
+            if self.block_size < max(self._candidate_lengths) + 1:
+                raise ValueError("Allocate speculative_num_draft_tokens >= max(K)+1.")
+        # Same seed on TP ranks: one common width per scheduler batch/round.
+        self._length_rng = random.Random(server_args.random_seed)
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -222,6 +233,28 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+    def _select_round_width(self) -> None:
+        if not self._candidate_lengths:
+            return
+        width = self._length_rng.choice(self._candidate_lengths) + 1
+        if width == self.block_size:
+            return
+        self.block_size = width
+        self.speculative_num_draft_tokens = width
+        self._block_pos_offsets = torch.arange(width, device=self.device, dtype=torch.int64)
+        self._draft_block_spec_info.draft_token_num = width
+        # FA3 eager metadata otherwise retains the allocation maximum (33).
+        for runner in (self.model_runner, self.draft_model_runner):
+            backend = runner.attn_backend
+            if hasattr(backend, "speculative_num_draft_tokens"):
+                backend.speculative_num_draft_tokens = width
+        # Buffers are shaped by actual width, not the server allocation maximum.
+        self._draft_block_ids_buf = None
+        self._draft_block_positions_buf = None
+        self._draft_block_tokens_buf = None
+        self._draft_block_end_buf = None
+        self._draft_seq_lens_cpu_buf = None
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -1309,6 +1342,7 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        self._select_round_width()
         self._prepare_for_speculative_decoding(batch, draft_input)
 
         model_worker_batch = batch.get_model_worker_batch()

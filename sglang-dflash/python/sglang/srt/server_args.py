@@ -486,6 +486,8 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
+    # Experimental eager spec-v1 OPD: candidates exclude the anchor.
+    speculative_dflash_candidate_lengths: Optional[List[int]] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None

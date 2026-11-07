@@ -266,7 +266,11 @@ def summarize(records, modes):
                    non_tail_spec_rounds=core,
                    non_tail_mean_accepted=sum(r["non_tail_accepted_tokens"] for r in group)/core if core else None,
                    non_tail_mean_committed=sum(r["non_tail_committed_tokens"] for r in group)/core if core else None,
-                   profile_rounds=group[0]["profile_rounds"])
+                   profile_rounds=group[0]["profile_rounds"],
+                   selector_wall_ms=sum(r.get("selector_wall_ms", 0.) for r in group),
+                   selector_calls=sum(r.get("selector_calls", 0) for r in group),
+                   selector_time_fraction=sum(r.get("selector_wall_ms", 0.) for r in group)/(1000*seconds),
+                   requested_k_histogram=json.dumps(dict(Counter(k for r in group for k in r["requested_actions"] if k))))
         for name in StageTimer.names:
             row[name] = sum(r[name] for r in group) if group[0]["profile_rounds"] else None
         summary.append(row)
@@ -276,8 +280,33 @@ def summarize(records, modes):
 def evaluate(args):
     target, draft, tokenizer, rows, rank, world = setup(args)
     head, costs = load_head(args.head, target.device, args) if args.head else (None, None)
-    widths = fixed_lengths(args.lengths, draft.block_size, args.fixed_lengths or [])
-    modes = ["ar"] + [f"fixed_{k}" for k in widths] + (["adaptive"] if head else [])
+    classifiers = {}
+    if getattr(args, "classifier", None):
+        if args.head or args.enable_thinking:
+            raise ValueError("KV classifiers use no-thinking collection and cannot be combined with the old head.")
+        from .two_stage.classifier import KVClassifier
+        from .two_stage.cli import model_identity
+        from .two_stage import K_VALUES
+        if tuple(args.lengths) != K_VALUES:
+            raise ValueError("KV classifier evaluation requires lengths 4 8 12 16 20 24 28 32.")
+        target_id, draft_id = model_identity(args.target), model_identity(args.draft)
+        used = set()
+        for path in args.classifier:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+            if checkpoint['metadata']['target'] != target_id or checkpoint['metadata']['draft'] != draft_id:
+                raise ValueError("Classifier frozen-model fingerprints differ from evaluation weights.")
+            classifier = KVClassifier(**checkpoint['settings']).to(target.device).eval()
+            classifier.load_state_dict(checkpoint['state_dict'])
+            name = f"classifier_{Path(path).stem}"
+            if name in classifiers:
+                raise ValueError("Duplicate classifier names")
+            classifiers[name] = classifier
+            used.update(checkpoint['used_prompt_keys'])
+        if any(key in used for key, _ in rows):
+            raise ValueError("Evaluation prompts overlap classifier training/validation; use labeled/test_prompts.jsonl.")
+    widths = (list(args.lengths) if getattr(args, "exact_lengths", False) else
+              fixed_lengths(args.lengths, draft.block_size, args.fixed_lengths or []))
+    modes = ["ar"] + [f"fixed_{k}" for k in widths] + (["adaptive"] if head else []) + list(classifiers)
     records = []
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -286,7 +315,8 @@ def evaluate(args):
                     head_lengths=list(head.lengths) if head else None,
                     tail_policy="min(requested_K, remaining-1); AR only with one token left",
                     profile_rounds=args.profile_rounds, strict_match=args.strict_match,
-                    seed=args.seed, max_new_tokens=args.max_new_tokens)
+                    seed=args.seed, max_new_tokens=args.max_new_tokens,
+                    classifiers={name: model.settings for name, model in classifiers.items()})
     (outdir / f"metadata_rank{rank:03d}.json").write_text(json.dumps(metadata, indent=2))
     with torch.inference_mode():
         for key, prompt in rows:
@@ -295,6 +325,8 @@ def evaluate(args):
                 warm = RoundRuntime(target, draft, ids)
                 for k in widths:
                     warm.propose(k)
+                for classifier in classifiers.values():
+                    classifier.choose(warm)
                 del warm
             reference = None
             for mode in modes:
@@ -302,6 +334,7 @@ def evaluate(args):
                 state = RoundRuntime(target, draft, ids)
                 prefill_s = clock() - t0
                 round_records = []
+                selector_wall_ms, selector_calls = 0., 0
                 timer = StageTimer(args.profile_rounds, target.device)
                 def measure(name):
                     return timer.measure(name) if timer.enabled else nullcontext()
@@ -310,7 +343,13 @@ def evaluate(args):
                     remaining = args.max_new_tokens - (state.prefix.shape[1] - ids.shape[1])
                     requested = 0
                     if mode != "ar" and remaining > 1:
-                        if mode == "adaptive":
+                        if mode in classifiers:
+                            selector_start = time.perf_counter()
+                            with measure("head_ms"):
+                                requested = classifiers[mode].choose(state)
+                            selector_wall_ms += (time.perf_counter()-selector_start)*1000
+                            selector_calls += 1
+                        elif mode == "adaptive":
                             with measure("head_ms"):
                                 pivot, anchor = state.features()
                                 # Select the learned nominal action, then apply exactly the
@@ -361,7 +400,8 @@ def evaluate(args):
                            non_tail_spec_rounds=len(core),
                            non_tail_accepted_tokens=sum(r["accepted"] for r in core),
                            non_tail_committed_tokens=sum(r["committed"] for r in core),
-                           profile_rounds=args.profile_rounds, **timer.resolve())
+                           profile_rounds=args.profile_rounds, selector_wall_ms=selector_wall_ms,
+                           selector_calls=selector_calls, **timer.resolve())
                 rec["mean_accepted"] = rec["accepted_tokens"]/len(spec) if spec else None
                 rec["mean_committed"] = rec["spec_committed_tokens"]/len(spec) if spec else None
                 records.append(rec)
@@ -506,6 +546,8 @@ def main():
             q.add_argument("--timing-repeats", type=int, default=2)
         if name == "eval":
             q.add_argument("--head")
+            q.add_argument("--classifier", nargs="+", help="Frozen KV classifiers; evaluated with all fixed-K baselines.")
+            q.add_argument("--exact-lengths", action="store_true", help="Do not automatically add the native candidate count.")
             q.add_argument("--strict-match", action="store_true")
             q.add_argument("--fixed-lengths", type=int, nargs="+", help="Additional fixed baselines; head actions stay unchanged.")
             q.add_argument("--profile-rounds", action="store_true", help="Optional stage CUDA events; compare speeds with profiling off.")

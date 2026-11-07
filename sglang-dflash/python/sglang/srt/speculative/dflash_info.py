@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.server_args import get_global_server_args
+
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -446,7 +448,10 @@ class DFlashVerifyInput(SpecInput):
                 isinstance(custom_params, dict)
                 and bool(custom_params.get("use_replay_dis", False))
             )
-            if use_replay_dis:
+            variable_width = bool(get_global_server_args().speculative_dflash_candidate_lengths)
+            if variable_width:
+                drafted_len = max_acc
+            if use_replay_dis or variable_width:
                 append_dflash_replay_block_metadata(
                     req,
                     appended,

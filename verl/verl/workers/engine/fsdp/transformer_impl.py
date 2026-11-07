@@ -1694,7 +1694,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 tu.get_non_tensor_data(data=micro_batch, key="opd_use_task_rewards", default=False)
             ),
         }
-        if use_replay_dis:
+        matched_widths = bool(getattr(self.model_config.hf_config, "verl_dflash_match_rollout_widths", False))
+        if use_replay_dis or matched_widths:
             model_inputs.update(
                 self._build_dflash_replay_block_tensors(
                     micro_batch=micro_batch,

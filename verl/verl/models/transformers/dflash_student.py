@@ -1697,6 +1697,85 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 output["dflash_entropy"] = entropy_by_seq
         return output
 
+    def _forward_matched_rollout_opd(self, arguments):
+        """Group actual rollout blocks by K; frozen teacher hidden is reused."""
+        args = dict(arguments)
+        args.pop("self", None)
+        extra = args.pop("kwargs", {})
+        args.update(extra)
+        mask = args.get("replay_block_mask")
+        drafted = args.get("replay_block_drafted_lengths")
+        anchors = args.get("replay_block_anchor_indices")
+        accepted = args.get("replay_block_accepted_lengths")
+        if any(v is None for v in (mask, drafted, anchors, accepted)):
+            raise ValueError("Matched-width OPD requires actual rollout block width/anchor/acceptance metadata.")
+        if not bool(mask.any()) and bool((args["response_lengths"] > 1).any()):
+            raise ValueError("Nontrivial response is missing rollout block metadata.")
+        for b in range(mask.shape[0]):
+            valid_anchors = anchors[b][mask[b]]
+            if valid_anchors.unique().numel() != valid_anchors.numel():
+                raise ValueError("Duplicate rollout block anchors")
+        if bool(((accepted < 0) | (accepted > drafted))[mask].any()):
+            raise ValueError("Invalid rollout accepted length")
+        rejection_mask = args.get("rejected_draft_mask")
+        if rejection_mask is not None:
+            links = ((args["rejected_draft_anchor_indices"][:, :, None] == anchors[:, None, :]) & mask[:, None, :])
+            if bool((rejection_mask & ~links.any(-1)).any()):
+                raise ValueError("Rejected proposal has no original rollout block")
+            widths = torch.where(links, drafted[:, None, :], 0).amax(-1)
+            if bool((rejection_mask & ((args["rejected_draft_offsets"] < 1) | (args["rejected_draft_offsets"] > widths))).any()):
+                raise ValueError("Rejected proposal offset exceeds original K")
+        lengths = self._get_train_candidate_lengths()
+        if any(int(k) not in lengths for k in drafted[mask].unique().tolist()):
+            raise ValueError("Rollout K is absent from configured training lengths.")
+        if args.get("use_tv_loss") or args.get("use_replay_dis"):
+            raise NotImplementedError("Matched-width scalar OPD does not support TV or replay-dis diagnostics.")
+        if self._get_random_response_anchor_enabled():
+            raise ValueError("Matched-width OPD requires original rollout anchors.")
+        ids = args["input_ids"]
+        with torch.no_grad():
+            out = self._forward_main_hidden_only(input_ids=ids, attention_mask=args["attention_mask"],
+                position_ids=args["position_ids"], use_cache=False, output_hidden_states=True, return_dict=True)
+            teacher = (self._extract_target_hidden(out.hidden_states), out.hidden_states[-1])
+        outputs, counts = [], []
+        for k in lengths:
+            group_mask = mask & (drafted == k)
+            # Identical width/forward schedule on all FSDP ranks, including
+            # zero-supervision groups. Empty groups take a zero-loss dummy pass.
+            call = dict(args)
+            rejection_mask = args.get("rejected_draft_mask")
+            if rejection_mask is not None:
+                same_anchor = (args["rejected_draft_anchor_indices"][:, :, None] == anchors[:, None, :])
+                call["rejected_draft_mask"] = rejection_mask & (same_anchor & group_mask[:, None, :]).any(-1)
+            call.update(_rollout_group=(k, group_mask), _teacher_hidden_pair=teacher)
+            outputs.append(self._forward_opd(**call))
+            counts.append(group_mask.sum().float())
+        # Outputs use common sequence/rejected-token coordinates, so scatter streams
+        # are disjoint and can be summed. Offsets are copied once, not added.
+        merged = dict(outputs[0])
+        additive = {"dflash_log_probs", "dflash_loss_mask", "dflash_teacher_log_probs", "dflash_entropy",
+                    "dflash_response_offsets", "dflash_rejected_draft_student_log_probs",
+                    "dflash_rejected_draft_teacher_log_probs"}
+        boolean = {"dflash_rejected_draft_loss_mask"}
+        total = sum(counts).clamp_min(1)
+        for name in merged:
+            if name in additive:
+                merged[name] = sum(o[name] for o in outputs)
+            elif name in boolean:
+                merged[name] = torch.stack([o[name] for o in outputs]).any(0)
+            elif name.startswith("dflash_opd_") and any(t in name for t in ("token_count", "block_count", "valid_anchor_count")):
+                merged[name] = sum(o[name] for o in outputs)
+        # Each response position belongs to exactly one original block.
+        if bool((merged["dflash_loss_mask"] > 1).any()):
+            raise RuntimeError("Overlapping response supervision in matched-width OPD.")
+        merged["dflash_opd_skipped_sample_count"] = (merged["dflash_loss_mask"].sum(-1) == 0).sum().float()
+        merged["dflash_opd_max_blocks_per_sample"] = sum(o["dflash_opd_max_blocks_per_sample"] for o in outputs)
+        for suffix in ("train_response_candidates", "native_replay_candidates"):
+            merged[f"dflash_opd_{suffix}"] = sum(o[f"dflash_opd_{suffix}"] * c for o, c in zip(outputs, counts)) / total
+        for k in lengths:
+            merged[f"dflash_opd_train_width_{k}_fraction"] = (mask & (drafted == k)).sum().float()/total
+        return merged
+
     def _forward_opd(
         self,
         *,
@@ -1726,12 +1805,33 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         if input_ids.dim() != 2:
             raise ValueError(f"DFLASH OPD requires padded 2D input_ids, got shape={tuple(input_ids.shape)}.")
 
+        rollout_group = kwargs.pop("_rollout_group", None)
+        teacher_hidden_pair = kwargs.pop("_teacher_hidden_pair", None)
+        matched = bool(getattr(self.config, "verl_dflash_match_rollout_widths", False))
+        if matched and rollout_group is None:
+            return self._forward_matched_rollout_opd(dict(
+                input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+                prompt_lengths=prompt_lengths, response_lengths=response_lengths,
+                reject_token_indices=reject_token_indices,
+                rejected_draft_anchor_indices=rejected_draft_anchor_indices,
+                rejected_draft_offsets=rejected_draft_offsets, rejected_draft_token_ids=rejected_draft_token_ids,
+                rejected_draft_teacher_logprobs=rejected_draft_teacher_logprobs,
+                rejected_draft_mask=rejected_draft_mask, use_tv_loss=use_tv_loss,
+                use_composed_teacher_logprobs=use_composed_teacher_logprobs,
+                rejected_draft_first_token_only=rejected_draft_first_token_only,
+                use_task_rewards=use_task_rewards, calculate_entropy=calculate_entropy,
+                use_replay_dis=use_replay_dis, replay_block_anchor_indices=replay_block_anchor_indices,
+                replay_block_accepted_lengths=replay_block_accepted_lengths,
+                replay_block_drafted_lengths=replay_block_drafted_lengths,
+                replay_block_mask=replay_block_mask, kwargs=kwargs))
         train_lengths = self._get_train_candidate_lengths()
         if use_tv_loss and train_lengths:
             raise NotImplementedError("Mixed response widths currently support scalar OPD only, not TV mode.")
         mixed_response_training = bool(train_lengths) and self.training and torch.is_grad_enabled()
         native_block_size = self._get_block_size()
         response_block_size = self._get_response_train_block_size()
+        if rollout_group is not None:
+            native_block_size = response_block_size = int(rollout_group[0]) + 1
 
         profile_enabled = self._is_dflash_profiling_enabled()
         self._maybe_sync_for_profile(profile_enabled, input_ids.device)
@@ -1761,20 +1861,23 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         target_kwargs.pop("dflash_replay_block_mask", None)
 
         teacher_start_time = time.perf_counter()
-        with torch.no_grad():
-            teacher_outputs = self._forward_main_hidden_only(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                output_hidden_states=True,
-                return_dict=True,
-                **target_kwargs,
-            )
-            if teacher_outputs.hidden_states is None:
-                raise RuntimeError("Teacher model did not return hidden states required by DFLASH draft.")
-            target_lm_hidden = teacher_outputs.hidden_states[-1]
-            target_hidden = self._extract_target_hidden(teacher_outputs.hidden_states)
+        if teacher_hidden_pair is not None:
+            target_hidden, target_lm_hidden = teacher_hidden_pair
+        else:
+            with torch.no_grad():
+                teacher_outputs = self._forward_main_hidden_only(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                    **target_kwargs,
+                )
+                if teacher_outputs.hidden_states is None:
+                    raise RuntimeError("Teacher model did not return hidden states required by DFLASH draft.")
+                target_lm_hidden = teacher_outputs.hidden_states[-1]
+                target_hidden = self._extract_target_hidden(teacher_outputs.hidden_states)
         self._maybe_sync_for_profile(profile_enabled, input_ids.device)
         teacher_forward_ms = (time.perf_counter() - teacher_start_time) * 1000.0
 
@@ -1830,6 +1933,30 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
             )
         )
 
+        if rollout_group is not None:
+            # Compact each K group before forwarding; masked blocks of other
+            # widths must not inflate query/attention tensors by up to eightfold.
+            group_k, group_mask = rollout_group
+            valid_seq_lens = prompt_lengths + response_lengths
+            original_positions = torch.where(replay_block_anchor_indices < 0,
+                prompt_lengths[:, None]-1, prompt_lengths[:, None]+replay_block_anchor_indices)
+            valid = group_mask & (original_positions >= 0) & (original_positions < valid_seq_lens[:, None]-1)
+            width = max(1, int(valid.sum(-1).max()))
+            anchor_positions = torch.zeros((input_ids.shape[0], width), dtype=torch.long, device=input_ids.device)
+            segment_lens = torch.zeros_like(anchor_positions)
+            block_keep_mask = torch.zeros_like(anchor_positions, dtype=torch.bool)
+            for b in range(input_ids.shape[0]):
+                selected = valid[b].nonzero(as_tuple=True)[0]
+                n = selected.numel()
+                if n:
+                    positions = original_positions[b, selected]
+                    anchor_positions[b, :n] = positions
+                    lengths = (replay_block_accepted_lengths[b, selected]+1).clamp(max=group_k)
+                    segment_lens[b, :n] = torch.minimum(lengths, (valid_seq_lens[b]-1-positions).clamp_min(0))
+                    block_keep_mask[b, :n] = True
+            row_starts = anchor_positions
+            opd_metrics["valid_anchor_count"] = int(block_keep_mask.sum())
+
         batch_size, seq_len = input_ids.shape
 
         def _plan_block_stats(
@@ -1876,6 +2003,25 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
         draft_q_token_count = (response_padded_block_count * response_block_size
                                + rejected_padded_block_count * native_block_size)
 
+        if rollout_group is not None:
+            if not bool(block_keep_mask.any()):
+                block_keep_mask = block_keep_mask.clone()
+                block_keep_mask[0, 0] = True
+                anchor_positions = anchor_positions.clone()
+                anchor_positions[0, 0] = 0
+                segment_lens = segment_lens.clone()
+                segment_lens[0, 0] = 0
+            if not bool(rejected_block_keep_mask.any()):
+                rejected_block_keep_mask = rejected_block_keep_mask.clone()
+                rejected_block_keep_mask[0, 0] = True
+                rejected_anchor_positions = rejected_anchor_positions.clone()
+                rejected_anchor_positions[0, 0] = 0
+
+        if rollout_group is not None:
+            # Include padded/dummy work in compute diagnostics.
+            draft_q_token_count = batch_size*(anchor_positions.shape[1]*response_block_size
+                + rejected_anchor_positions.shape[1]*native_block_size)
+
         output_embeddings = self.get_output_embeddings()
         if output_embeddings is None:
             raise RuntimeError("Main model output embeddings are required for composed DFLASH student logits.")
@@ -1914,6 +2060,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 checkpoint_forward=split_random_rejected_pass,
             )
             draft_forward_ms += response_draft_forward_ms
+            if rollout_group is not None:
+                log_probs_by_seq = log_probs_by_seq + draft_hidden.sum(dtype=torch.float32)*0.0
             ran_draft_forward = True
 
             response_batch_indices: list[torch.Tensor] = []
@@ -2012,6 +2160,8 @@ class ComposedDFlashStudentForCausalLM(PreTrainedModel):
                 checkpoint_forward=True,
             )
             draft_forward_ms += rejected_draft_forward_ms
+            if rollout_group is not None:
+                log_probs_by_seq = log_probs_by_seq + rejected_draft_hidden.sum(dtype=torch.float32)*0.0
             attn_impl = rejected_attn_impl
             ran_draft_forward = True
             rejected_student_log_probs, rejected_teacher_log_probs, rejected_loss_mask = (

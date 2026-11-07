@@ -50,6 +50,8 @@ class DFlashWorkerV2(DFlashWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        if server_args.speculative_dflash_candidate_lengths:
+            raise ValueError("Variable-width DFLASH requires non-overlap spec-v1 scheduling.")
         super().__init__(
             server_args=server_args,
             gpu_id=gpu_id,

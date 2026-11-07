@@ -49,7 +49,7 @@ export EXP_NAME=${EXP_NAME:-qwen3-4b-native-opd-$ARM-$(date +%Y%m%d_%H%M%S)}
 export CKPT_DIR=${CKPT_DIR:-$ROOT/checkpoints/$EXP_NAME}
 # Empty config is the unmodified native-width response/rejected stream path.
 WIDTH_CONFIG='[]'
-if [[ "$ARM" == mixed ]]; then WIDTH_CONFIG=${NATIVE_MIXED_LENGTHS:-'[4,8,12,16,24,32]'}; fi
+if [[ "$ARM" == mixed ]]; then WIDTH_CONFIG=${NATIVE_MIXED_LENGTHS:-'[4,8,12,16,20,24,28,32]'}; fi
 EXTRA=()
 if [[ -n ${NATIVE_OPD_BATCH_STEPS:-} ]]; then
     EXTRA+=("trainer.total_training_steps=$NATIVE_OPD_BATCH_STEPS")
@@ -73,8 +73,8 @@ assert torch.equal(restored[:, 1:], x[:, 1:])
 print('Padding preflight passed (flash_attn is optional for padding helpers).')
 PY
 mkdir -p "$CKPT_DIR"
-printf 'arm=%s\nresponse_train_lengths=%s\nrollout_and_rejected_replay=native\ncheckpoint=%s\n' \
-    "$ARM" "$WIDTH_CONFIG" "$CKPT_DIR"
+printf 'arm=%s\nresponse_train_lengths=%s\nrollout_and_rejected_replay=%s\ncheckpoint=%s\n' \
+    "$ARM" "$WIDTH_CONFIG" "${NATIVE_ROLLOUT_MODE:-native}" "$CKPT_DIR"
 exec bash verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh \
     "actor_rollout_ref.model.path=$MAIN_MODEL_PATH" \
     "++actor_rollout_ref.model.override_config.verl_dflash_main_model_path=$MAIN_MODEL_PATH" \

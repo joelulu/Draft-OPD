@@ -99,3 +99,75 @@ def test_eval_and_no_grad_keep_native_width_and_tv_rejects_mixed_mode():
     student.config.verl_dflash_train_candidate_lengths = [32, 4]
     with pytest.raises(ValueError, match='increasing'):
         student._get_train_candidate_lengths()
+
+
+def matched_batch():
+    args = batch()
+    args.update(dflash_replay_block_anchor_indices=torch.tensor([[-1, 2, 6]]),
+                dflash_replay_block_accepted_lengths=torch.tensor([[2, 3, 4]]),
+                dflash_replay_block_drafted_lengths=torch.tensor([[7, 7, 7]]),
+                dflash_replay_block_mask=torch.ones(1, 3, dtype=torch.bool))
+    return args
+
+
+def test_matched_constant_width_equals_native_and_has_only_draft_gradients():
+    baseline = make_student([7])
+    matched = make_student([7])
+    matched.config.verl_dflash_match_rollout_widths = True
+    a, b = baseline(**batch()), matched(**matched_batch())
+    for name in ('dflash_log_probs', 'dflash_loss_mask', 'dflash_teacher_log_probs',
+                 'dflash_rejected_draft_student_log_probs', 'dflash_rejected_draft_loss_mask'):
+        torch.testing.assert_close(a[name], b[name], atol=2e-6, rtol=2e-6)
+    (-b['dflash_log_probs'].sum()-b['dflash_rejected_draft_student_log_probs'].sum()).backward()
+    assert matched.draft_model.fc.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in matched.main_model.parameters())
+
+
+def test_matched_mixed_widths_execute_all_groups_and_preserve_rejected_offset():
+    matched = make_student([4, 8, 12, 16, 20, 24, 28, 32])
+    matched.config.verl_dflash_match_rollout_widths = True
+    args = matched_batch()
+    args['dflash_replay_block_drafted_lengths'] = torch.tensor([[8, 4, 8]])
+    calls = []
+    forward = matched._run_dflash_draft_forward
+    def capture(**kwargs):
+        calls.append(kwargs['draft_block_size'])
+        return forward(**kwargs)
+    matched._run_dflash_draft_forward = capture
+    out = matched(**args)
+    assert calls == [width for k in [4, 8, 12, 16, 20, 24, 28, 32] for width in [k+1, k+1]]
+    assert out['dflash_rejected_draft_loss_mask'].item()
+    assert out['dflash_rejected_draft_teacher_log_probs'].item() == -2.5
+    assert out['dflash_loss_mask'].sum() == 12
+    assert out['dflash_loss_mask'].max() == 1
+    torch.testing.assert_close(out['dflash_opd_train_width_8_fraction'], torch.tensor(2/3))
+    (-out['dflash_log_probs'].sum()-out['dflash_rejected_draft_student_log_probs'].sum()).backward()
+    assert matched.draft_model.fc.weight.grad.abs().sum() > 0
+
+
+def test_matched_rejects_missing_or_inconsistent_metadata():
+    matched = make_student([4, 8])
+    matched.config.verl_dflash_match_rollout_widths = True
+    with pytest.raises(ValueError, match='requires actual'):
+        matched(**batch())
+    args = matched_batch()
+    args['dflash_replay_block_drafted_lengths'][:] = 4
+    with pytest.raises(ValueError, match='offset exceeds'):
+        matched(**args)
+
+
+def test_matched_prefill_only_eos_takes_zero_loss_collective_schedule():
+    matched = make_student([4, 8])
+    matched.config.verl_dflash_match_rollout_widths = True
+    ids = torch.arange(4)[None]
+    output = matched(input_ids=ids, attention_mask=torch.ones_like(ids),
+        dflash_prompt_lengths=torch.tensor([3]), dflash_response_lengths=torch.tensor([1]),
+        dflash_reject_token_indices=torch.tensor([[-1]]),
+        dflash_replay_block_anchor_indices=torch.tensor([[-2]]),
+        dflash_replay_block_accepted_lengths=torch.tensor([[0]]),
+        dflash_replay_block_drafted_lengths=torch.tensor([[0]]),
+        dflash_replay_block_mask=torch.tensor([[False]]))
+    assert output['dflash_loss_mask'].sum()==0
+    assert output['dflash_log_probs'].sum()==0
+    output['dflash_log_probs'].sum().backward()
+    assert matched.draft_model.fc.weight.grad is not None

@@ -1,5 +1,7 @@
 # Original verl OPD with mixed response widths
 
+For the complete two-stage variable-rollout/classifier pipeline see [TWO_STAGE.md](TWO_STAGE.md).
+
 This is separate from `compare_training.sh`, the standalone reference trainer.
 `native_opd.sh fixed|mixed` calls the repository's original
 `verl/examples/on_policy_distillation_trainer/run_qwen_gsm8k_forward-ins.sh`.
@@ -12,7 +14,7 @@ length-prediction head is added.
 - `fixed`: `verl_dflash_train_candidate_lengths=[]`; the original native-width
   response/rejected forward path is preserved.
 - `mixed`: response training forwards sample an actual candidate count from
-  `[4,8,12,16,24,32]`, with input width K+1. One width is sampled per composed
+  `[4,8,12,16,20,24,28,32]`, with input width K+1. One width is sampled per composed
   gradient-bearing training forward, not per optimizer update. Eval/no-grad
   logprob computation uses native width.
 - Rollout and rejected-proposal replay retain native width (usually 15 candidates).
