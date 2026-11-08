@@ -242,6 +242,9 @@ def replay(target, draft, ids, schedule, fixed_k, selector, head, args, eos,
     if excess:
         effective[-1]['committed'] -= excess
     spec = [r for r in effective if r['actual_k']]
+    round_details = [dict(r, round=i+1,
+        accepted=max(0, r['committed']-1) if r['actual_k'] else 0,
+        tail=0 < r['actual_k'] < r['requested_k']) for i, r in enumerate(effective)]
     return dict(tokens=len(generated), decode_s=decode_s, prefill_s=prefill_s,
         decode_tok_s=len(generated)/decode_s, rounds=len(records), spec_rounds=len(spec),
         ar_steps=len(records)-len(spec),
@@ -251,7 +254,74 @@ def replay(target, draft, ids, schedule, fixed_k, selector, head, args, eos,
         requested_k_counts=dict(Counter(r['requested_k'] for r in spec)),
         selector_calls=selector_calls, selector_wall_ms=selector_wall_ms,
         output_sha256=signature(generated), replay_verified=schedule is not None,
+        round_details=round_details,
         profile=profiler.resolve() if profiler else None)
+
+
+def format_rounds(rounds):
+    """accepted(actual K), not committed length or number of selected classes."""
+    return ', '.join(f"{r['accepted']}({r['actual_k']})" if r['actual_k'] else 'AR'
+                     for r in rounds)
+
+
+def report_rounds(result, output, print_trace=False):
+    fields = ['arm', 'prompt_index', 'prompt_key', 'mode', 'repeat', 'round',
+              'requested_k', 'actual_k', 'accepted', 'accepted_raw', 'committed', 'tail']
+    exists = output.exists()
+    with output.open('a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        identity = {k:result[k] for k in fields[:5]}
+        for r in result['round_details']:
+            writer.writerow(dict(identity, **r))
+    if print_trace:
+        print(f"ROUNDS [{result['arm']}] prompt={result['prompt_index']} "
+              f"{result['mode']} accepted(actual_K):\n"
+              f"  {format_rounds(result['round_details'])}", flush=True)
+        hist = result['requested_k_counts']
+        print('  requested K counts:', json.dumps(hist), flush=True)
+
+
+def summarize_simple(summary, output):
+    baseline = next(r['tok_s'] for r in summary if r['arm']=='fixed' and r['mode']=='fixed_16')
+    rows = []
+    print('\nGSM8K: each draft compared with its own fixed K16')
+    print('draft  mode              tok/s   accepted   committed   rounds/1k  gain vs own K16')
+    for arm in ('fixed', 'mixed'):
+        own = next(r['tok_s'] for r in summary if r['arm']==arm and r['mode']=='fixed_16')
+        for mode in ('fixed_16', 'oracle_accept'):
+            r = next(r for r in summary if r['arm']==arm and r['mode']==mode)
+            row = dict(arm=arm, mode=mode, tok_s=r['tok_s'], accepted=r['accepted'],
+                committed=r['committed'], spec_rounds_per_1k_tokens=r['spec_rounds_per_1k_tokens'],
+                gain_vs_own_k16_pct=100*(r['tok_s']/own-1),
+                gain_vs_fixed_train_k16_pct=100*(r['tok_s']/baseline-1))
+            rows.append(row)
+            print(f"{arm:5s}  {mode:16s} {r['tok_s']:8.2f} {r['accepted']:10.3f} "
+                  f"{r['committed']:11.3f} {r['spec_rounds_per_1k_tokens']:11.1f} "
+                  f"{row['gain_vs_own_k16_pct']:+.2f}%")
+    with output.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def summarize_round_distribution(records, output):
+    groups = defaultdict(list)
+    for r in records:
+        if r['repeat'] == 0:  # No triple-counting repeated identical trajectories.
+            for detail in r['round_details']:
+                groups[r['arm'], r['mode'], detail['actual_k']].append(detail)
+    rows = []
+    for (arm, mode, k), rounds in sorted(groups.items()):
+        total = sum(len(v) for (a, m, _), v in groups.items() if a == arm and m == mode)
+        rows.append(dict(arm=arm, mode=mode, actual_k=k, rounds=len(rounds),
+            fraction=len(rounds)/total, mean_accepted=statistics.mean(r['accepted'] for r in rounds),
+            accepted_histogram=json.dumps(dict(Counter(r['accepted'] for r in rounds)))))
+    with output.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def summarize(records, path):
@@ -325,6 +395,8 @@ def main():
     p.add_argument('--search-repeats', type=int, default=3)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--no-profile', action='store_true')
+    p.add_argument('--simple', action='store_true', help='Only own fixed K16 and acceptance oracle; no selector')
+    p.add_argument('--print-rounds', action='store_true', help='Print accepted(actual K) after first timed repeat')
     args = p.parse_args()
     if min(args.samples, args.max_new_tokens, args.max_prompt, args.repeats, args.search_repeats)<1:
         p.error('All limits must be positive')
@@ -378,7 +450,7 @@ def main():
             torch.manual_seed(args.seed)
             head = torch.nn.Sequential(torch.nn.LayerNorm(draft.config.hidden_size),
                 torch.nn.Linear(draft.config.hidden_size, 128), torch.nn.SiLU(),
-                torch.nn.Linear(128, 8)).cuda().eval().requires_grad_(False)
+                torch.nn.Linear(128, 8)).cuda().eval().requires_grad_(False) if not args.simple else None
             for index, (key, ids) in enumerate(selected, 1):
                 print(f'[{arm}] prompt {index}/{len(selected)} {key[:12]}: warming shapes', flush=True)
                 warm = RoundRuntime(target, draft, ids)
@@ -387,29 +459,31 @@ def main():
                     block = warm.propose(k)
                     warm.verify(block)
                     warm.draft_cache.crop(boundary)
-                for mode in ('full_kv', 'window_64'):
+                for mode in (() if args.simple else ('full_kv', 'window_64')):
                     native_predictor_probe(warm, mode, head, torch)
                 del warm
                 schedules = {}
-                for objective in ('accept', 'speed'):
+                for objective in (('accept',) if args.simple else ('accept', 'speed')):
                     print(f'[{arm}] prompt {index}: discover {objective}', flush=True)
                     schedules[objective] = discover(target, draft, ids, objective, args,
                         tokenizer.eos_token_id, RoundRuntime, clock, torch)
                     json_write(out/'schedules'/arm/f'{key}_{objective}.json', schedules[objective])
-                jobs = [(f'fixed_{k}', None, k, None) for k in KS]
+                jobs = [(f'fixed_{k}', None, k, None) for k in ([16] if args.simple else KS)]
                 jobs += [(f'oracle_{obj}', schedules[obj], None, None) for obj in schedules]
-                jobs += [(f'perfect_accept_{mode}', schedules['accept'], None, mode)
-                         for mode in ('full_kv', 'window_64')]
+                if not args.simple:
+                    jobs += [(f'perfect_accept_{mode}', schedules['accept'], None, mode)
+                             for mode in ('full_kv', 'window_64')]
                 for repeat in range(args.repeats):
                     order = jobs.copy()
                     random.Random(args.seed+repeat+index*100).shuffle(order)
                     for mode, schedule, k, selector in order:
                         r = replay(target, draft, ids, schedule, k, selector, head, args,
                             tokenizer.eos_token_id, RoundRuntime, clock, torch)
-                        r.update(arm=arm, mode=mode, repeat=repeat, prompt_key=key)
+                        r.update(arm=arm, mode=mode, repeat=repeat, prompt_key=key, prompt_index=index)
                         records.append(r)
                         with (out/'results.jsonl').open('a') as f:
                             f.write(json.dumps(r)+'\n')
+                        report_rounds(r, out/'rounds.csv', args.print_rounds and repeat == 0)
                         print(f"[{arm}] {index}/{len(selected)} repeat={repeat+1}/{args.repeats} "
                               f"{mode}: {r['decode_tok_s']:.2f} tok/s", flush=True)
                 if not args.no_profile:
@@ -423,6 +497,11 @@ def main():
             torch.cuda.empty_cache()
     summary = summarize(records, out/'comparison.csv')
     summarize_profiles(out/'profiles.jsonl', out/'profile_comparison.csv')
+    if args.simple:
+        summarize_simple(summary, out/'simple_comparison.csv')
+        summarize_round_distribution(records, out/'round_distribution.csv')
+        print(f'Results: {out}/simple_comparison.csv; rounds: {out}/rounds.csv', flush=True)
+        return
     # Token-normalized slack is the maximum extra ms/call under additive-cost assumptions.
     budgets = []
     for arm in ('fixed', 'mixed'):

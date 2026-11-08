@@ -112,3 +112,46 @@ def test_summary_uses_token_weighted_throughput(tmp_path):
                 accepted_tokens=2, committed_tokens=4, candidate_tokens=32, selector_wall_ms=0))
     summary = oracle.summarize(rows, tmp_path/'comparison.csv')
     assert all(r['tok_s'] == 6 for r in summary)
+
+
+def test_round_print_and_csv_keep_actual_and_requested_k(tmp_path):
+    import csv
+    rounds = [dict(round=1, requested_k=16, actual_k=16, accepted=4,
+                   accepted_raw=4, committed=5, tail=False),
+              dict(round=2, requested_k=16, actual_k=6, accepted=3,
+                   accepted_raw=3, committed=4, tail=True),
+              dict(round=3, requested_k=0, actual_k=0, accepted=0,
+                   accepted_raw=0, committed=1, tail=False)]
+    assert oracle.format_rounds(rounds) == '4(16), 3(6), AR'
+    r = dict(arm='fixed', prompt_index=1, prompt_key='abc', mode='fixed_16', repeat=0,
+             round_details=rounds, requested_k_counts={16:2})
+    oracle.report_rounds(r, tmp_path/'rounds.csv', True)
+    data = list(csv.DictReader((tmp_path/'rounds.csv').open()))
+    assert data[1]['actual_k'] == '6' and data[1]['requested_k'] == '16'
+    oracle.summarize_round_distribution([r, dict(r, repeat=1)], tmp_path/'dist.csv')
+    assert sum(int(v['rounds']) for v in csv.DictReader((tmp_path/'dist.csv').open())) == 3
+
+
+def test_prepare_gsm8k_preserves_source_and_excludes_answer():
+    spec = importlib.util.spec_from_file_location('gsm_prepare', Path(__file__).with_name('prepare_gsm8k_oracle.py'))
+    prep = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prep)
+    selected = prep.prepare([dict(question='Q1', answer='secret'), dict(question='Q1'),
+                             dict(question='Q2', answer='other')], 2)
+    assert [r['source_index'] for r in selected] == [0, 2]
+    assert selected[0]['prompt'] == [dict(role='user', content='Q1')]
+    assert selected[0]['answer'] == 'secret'
+    with pytest.raises(ValueError, match='Only'):
+        prep.prepare([dict(question='Q1')], 2)
+
+
+def test_simple_summary_compares_each_arm_to_own16(tmp_path):
+    import csv
+    rows = [dict(arm=a, mode=m, tok_s=t, accepted=4, committed=5,
+                 spec_rounds_per_1k_tokens=200)
+            for a, m, t in [('fixed','fixed_16',100), ('fixed','oracle_accept',120),
+                             ('mixed','fixed_16',110), ('mixed','oracle_accept',132)]]
+    oracle.summarize_simple(rows, tmp_path/'simple.csv')
+    result = list(csv.DictReader((tmp_path/'simple.csv').open()))
+    assert float(result[3]['gain_vs_own_k16_pct']) == pytest.approx(20)
+    assert float(result[3]['gain_vs_fixed_train_k16_pct']) == pytest.approx(32)

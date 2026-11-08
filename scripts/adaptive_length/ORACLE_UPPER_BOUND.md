@@ -1,5 +1,37 @@
 # Fixed/mixed local-oracle benchmark
 
+## Simple GSM8K eight-prompt comparison (no predictor)
+
+```bash
+export RESULT_ROOT="$PWD/runs/fixed_vs_dynamic_20261107_051744"
+EVAL_GPU=7 EVAL_SAMPLES=8 MAX_NEW_TOKENS=512 EVAL_REPEATS=3 \
+  bash scripts/adaptive_length/run_gsm8k_oracle.sh
+```
+
+Downloads/uses cached `openai/gsm8k`, config `main`, split `test`. Selects the
+first eight unique questions in source order, no shuffle. Only raw question is
+input as a user message; reference answers are saved for provenance, never fed
+to the model. Source indices and dataset fingerprint are saved. If Hugging Face
+is unavailable, set `GSM8K_TEST_JSONL=/absolute/path/to/test.jsonl` for an existing
+GSM8K test file containing `question` and optional `answer`. Local-file provenance
+is recorded honestly; test membership is then the caller's responsibility.
+
+Both drafts run fixed K16 and acceptance oracle only. No predictor is created,
+warmed, or executed; speed-oracle search and separate profiling are skipped.
+Prints first timed repeat's full `accepted(actual_K)` trajectory per prompt,
+e.g. `4(16), 6(16), 3(8), AR`. Accepted excludes anchor; committed is accepted+1.
+Oracle candidates remain 4..32 at interval4, **not** K=accepted. Near the output
+budget, actual K can clip to other integers. `rounds.csv` retains requested K,
+actual K, effective emitted acceptance, raw acceptance and committed length,
+including EOS adjustment. Printing and CSV writing occur outside timed decode.
+
+`simple_comparison.csv` reports four rows and gains relative to each draft's own
+K16 plus the common fixed-trained K16 baseline. `round_distribution.csv` groups
+actual K and acceptance histograms using first repeat only. `results.jsonl`
+retains all repeats. Existing full matrix mode remains unchanged apart from
+additional saved round details. Prompts stop on EOS or the configured token cap;
+the cap is not a guarantee that the full reasoning answer finishes.
+
 Run from the repository root with the existing fixed/mixed exported drafts.
 This does not train a predictor, modify existing models, or reuse the mixed
 draft's labels as if they belonged to the fixed draft.
