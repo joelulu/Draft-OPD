@@ -9,6 +9,11 @@ def prepare(rows, count):
     selected, seen = [], set()
     for index, row in enumerate(rows):
         question = row.get('question')
+        if question is None and 'turns' in row:
+            turns = row['turns']
+            if not isinstance(turns, list) or len(turns) != 1:
+                raise ValueError(f'Expected a single-turn GSM8K prompt at source row {index}')
+            question = turns[0]
         if not isinstance(question, str) or not question.strip():
             raise ValueError(f'Invalid GSM8K question at source row {index}')
         if question in seen:
