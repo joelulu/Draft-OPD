@@ -1,5 +1,45 @@
 # Fixed/mixed local-oracle benchmark
 
+## Audit whether extra block width changes acceptance
+
+No GPU or model loading is needed; uses the already saved same-state trials,
+including candidate token IDs from oracle discovery.
+
+```bash
+python scripts/adaptive_length/analyze_k_dependence.py \
+  --root "$RESULT_ROOT/gsm8k_oracle_20261108_063529"
+```
+
+Analyzes each draft's own acceptance-oracle trajectory. Excludes states with
+tail-clipped K or EOS-adjusted acceptance. For each state, computes maximum
+acceptance A, smallest tested K achieving A, and smallest grid K that merely
+has capacity for A. Example: A=6 has capacity-sized grid K8; if K8 accepts3 but
+K16 accepts6, extra width is needed for this observed maximum among tested Ks.
+This does **not** measure the untested exact K6. A=0 states have no positive
+acceptance to explain and are excluded from the extra-width-required rate.
+
+Also compares every small/large K pair at identical state, reporting:
+
+- Candidate token differences within their shared prefix (anchor excluded).
+- Whether acceptance differs from simple truncation of the larger block.
+- Whether the larger K reduces acceptance.
+- Whether a larger K improves acceptance even when the smaller K can already
+  hold the larger block's entire accepted prefix. The denominator is only
+  pairs with `0 < large_accept <= small_K`, not all 28 pairs per state.
+- Identical shared candidates but inconsistent truncated acceptance. This is
+  a flag to investigate target numerical behavior/cache verification; it is
+  not automatically a cache bug and cannot be resolved with this offline data.
+
+Saves `summary.json`, one row per state in `states.csv`, all same-state pair
+comparisons in `pairs.csv`, per-prompt counts in `per_prompt.csv`, and concrete
+extra-width examples with candidate IDs in `examples.json`. Output directory
+is fresh under the evaluated run. Source schedules are never modified.
+
+Observed candidate changes establish K-dependent proposal behavior; they do
+not identify how much comes from MASK attention vs tensor-shape numerics, and
+do not prove that larger K always helps. A forward attention intervention or
+controlled numerical replay would be needed for that causal attribution.
+
 ## Simple GSM8K eight-prompt comparison (no predictor)
 
 ```bash
