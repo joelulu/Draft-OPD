@@ -9,9 +9,9 @@ THRESHOLDS=(0.1,0.2,0.4)
 
 def choose(probs, threshold):
     # Positions are zero-based internally, returned one-based for reports.
-    return next((i+1 for i in range(len(probs)-2)
+    return next((i+1 for i in range(len(probs)-1)
         if probs[i][0]-probs[i][1]<=threshold
-        and probs[i+1][0]>=0.9 and probs[i+2][0]>=0.9),None)
+        and any(p[0]>0.8 for p in probs[i+1:])),None)
 
 
 def category(position, accepted, width=16):
@@ -29,7 +29,7 @@ def summarize(rows):
         n=len(eligible); selected=sum(t['position'] is not None for t in trials)
         hits=sum(t['category']=='hit_first_error' for t in trials)
         errors=sum(r['accepted']<16 for r in eligible)
-        cover=sum(r['accepted']<14 for r in eligible)
+        cover=sum(r['accepted']<15 for r in eligible)
         base=sum(r['accepted'] for r in eligible)
         repaired=sum(t['accepted_repaired'] for t in trials)
         output.append(dict(threshold=threshold,blocks_total=len(rows),blocks_non_eos=n,
@@ -73,7 +73,8 @@ def main():
     prompts=prepare((json.loads(l) for l in Path(args.data).read_text().splitlines() if l.strip()),args.samples)
     (out/'prompts.json').write_text(json.dumps(prompts,ensure_ascii=False,indent=2))
     (out/'metadata.json').write_text(json.dumps(dict(**vars(args),thresholds=THRESHOLDS,
-        following_top1_min=0.9,following_positions=2,selection='earliest eligible K16 position, K8 diagnostic only',
+        rule_version='any_later_top1_gt_0.8',following_top1_threshold=0.8,
+        following_comparison='strictly_greater',following_positions='any later candidate in K16 block',selection='earliest eligible K16 position, K8 diagnostic only',
         scope='paired states on original K16 trajectory; oracle token repair, not deployed correction or speed benchmark'),indent=2))
     target=AutoModelForCausalLM.from_pretrained(args.target,torch_dtype=torch.bfloat16,
         attn_implementation='sdpa').cuda().eval().requires_grad_(False)
