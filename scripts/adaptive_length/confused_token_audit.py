@@ -81,7 +81,7 @@ def main():
         attn_implementation='sdpa').cuda().eval().requires_grad_(False)
     draft=DFlashDraftModel.from_pretrained(args.fixed_draft,torch_dtype=torch.bfloat16,
         attn_implementation='sdpa').cuda().eval().requires_grad_(False)
-    from cross_k_repair import select_tokens,summarize_cross
+    from cross_k_repair import METHODS,select_tokens,summarize_cross
     eos=tok.eos_token_id
     def details(logits):
         values=logits[0].float();lp=values.log_softmax(-1);work=values.clone();ids=[]
@@ -150,7 +150,7 @@ def main():
                             replacements=select_tokens(probabilities,top,original)
                             diagnostics=dict(top2_by_k=top,candidate_probabilities=probabilities)
                         else:
-                            replacements={name:None for name in ('vote','mean_probability','contrast16_8','contrast24_16')}
+                            replacements={name:None for name in METHODS}
                         methods={}
                         for method,token in replacements.items():
                             changed=position is not None and token!=original

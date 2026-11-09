@@ -2,7 +2,7 @@
 import math
 from collections import Counter
 
-METHODS=('vote','mean_probability','contrast16_8','contrast24_16')
+METHODS=('vote','mean_probability','contrast16_8','contrast8_16','contrast24_16','contrast16_24')
 
 
 def select_tokens(probabilities, top2, original):
@@ -14,13 +14,15 @@ def select_tokens(probabilities, top2, original):
     votes=Counter(ids[0] for ids in top2.values())
     result={'vote':best(lambda t:votes[t]),
         'mean_probability':best(lambda t:sum(p[t] for p in probabilities.values())/len(probabilities))}
-    for name,strong,weak in [('contrast16_8',16,8),('contrast24_16',24,16)]:
+    for name,strong,weak,pool in [('contrast16_8',16,8,16),('contrast8_16',8,16,16),
+                                  ('contrast24_16',24,16,24),('contrast16_24',16,24,24)]:
         if strong not in probabilities or weak not in probabilities:
             result[name]=original
         else:
-            # alpha=1. Limit to strong distribution's top2 to prevent tiny-probability artifacts.
+            # alpha=1. Each forward/reverse pair shares its original top2 pool.
+            # This isolates score direction from changes in candidate membership.
             result[name]=best(lambda t:2*math.log(max(probabilities[strong][t],1e-30))
-                -math.log(max(probabilities[weak][t],1e-30)),top2[strong])
+                -math.log(max(probabilities[weak][t],1e-30)),top2[pool])
     return result
 
 
