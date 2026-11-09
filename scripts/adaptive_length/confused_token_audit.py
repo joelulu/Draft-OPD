@@ -59,6 +59,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--target',required=True);p.add_argument('--fixed-draft',required=True)
     p.add_argument('--data',required=True);p.add_argument('--output',required=True)
+    p.add_argument('--cross-k-repair',action='store_true',help='Add K24 and draft-only cross-K corrections')
     p.add_argument('--samples',type=int,default=16);p.add_argument('--max-new-tokens',type=int,default=512)
     args=p.parse_args()
     if args.samples<1 or args.max_new_tokens<17: p.error('Need positive samples and at least 17 output tokens')
@@ -74,12 +75,13 @@ def main():
     (out/'prompts.json').write_text(json.dumps(prompts,ensure_ascii=False,indent=2))
     (out/'metadata.json').write_text(json.dumps(dict(**vars(args),thresholds=THRESHOLDS,
         rule_version='any_later_top1_gt_0.8',following_top1_threshold=0.8,
-        following_comparison='strictly_greater',following_positions='any later candidate in K16 block',selection='earliest eligible K16 position, K8 diagnostic only',
-        scope='paired states on original K16 trajectory; oracle token repair, not deployed correction or speed benchmark'),indent=2))
+        following_comparison='strictly_greater',following_positions='any later candidate in K16 block',selection='earliest eligible K16 position; cross-K draft-only repair when enabled',
+        scope='paired states on original K16 trajectory; oracle and optional draft-only one-token repairs, not a speed benchmark'),indent=2))
     target=AutoModelForCausalLM.from_pretrained(args.target,torch_dtype=torch.bfloat16,
         attn_implementation='sdpa').cuda().eval().requires_grad_(False)
     draft=DFlashDraftModel.from_pretrained(args.fixed_draft,torch_dtype=torch.bfloat16,
         attn_implementation='sdpa').cuda().eval().requires_grad_(False)
+    from cross_k_repair import select_tokens,summarize_cross
     eos=tok.eos_token_id
     def details(logits):
         values=logits[0].float();lp=values.log_softmax(-1);work=values.clone();ids=[]
@@ -102,6 +104,10 @@ def main():
                 round_index+=1
                 b8,l8=rt.propose(8,return_logits=True)
                 b16,l16=rt.propose(16,return_logits=True)
+                if args.cross_k_repair:
+                    b24,l24=rt.propose(24,return_logits=True)
+                    ids24,pr24=details(l24)
+                    distributions={k:l[0].float().softmax(-1) for k,l in [(8,l8),(16,l16),(24,l24)]}
                 base=rt.verify(b16)
                 ids8,pr8=details(l8);ids16,pr16=details(l16)
                 record=dict(prompt_index=pi,source_index=prompt['source_index'],round=round_index,
@@ -129,6 +135,36 @@ def main():
                     perfect_result=rt.verify(perfect)
                 any_eos=any_eos or has_eos(perfect,perfect_result)
                 record.update(perfect_accepted=perfect_result[0],any_eos=any_eos)
+                if args.cross_k_repair:
+                    record.update(top2_ids_k24=ids24,top2_probs_k24=pr24,cross={})
+                    cross_eos=any_eos
+                    for threshold in THRESHOLDS:
+                        position=record['rules'][str(threshold)]['position']
+                        original=int(b16[0,position]) if position else None
+                        target_id=int(base[1][0,position-1]) if position else None
+                        diagnostics=None
+                        if position:
+                            top={k:ids[position-1] for k,ids in [(8,ids8),(16,ids16),(24,ids24)] if position<=k}
+                            union=sorted(set(t for ids in top.values() for t in ids))
+                            probabilities={k:dict(zip(union,dist[position-1,union].tolist())) for k,dist in distributions.items() if k in top}
+                            replacements=select_tokens(probabilities,top,original)
+                            diagnostics=dict(top2_by_k=top,candidate_probabilities=probabilities)
+                        else:
+                            replacements={name:None for name in ('vote','mean_probability','contrast16_8','contrast24_16')}
+                        methods={}
+                        for method,token in replacements.items():
+                            changed=position is not None and token!=original
+                            repair=b16.clone();result=base
+                            if changed:
+                                repair[0,position]=token
+                                result=rt.verify(repair)
+                            cross_eos=cross_eos or has_eos(repair,result)
+                            methods[method]=dict(position=position,original_token=original,replacement_token=token,
+                                changed=changed,matches_target_at_position=token==target_id if position else False,
+                                accepted_repaired=result[0],gain=result[0]-base[0])
+                        record['cross'][str(threshold)]=methods
+                        record.setdefault('cross_diagnostics',{})[str(threshold)]=diagnostics
+                    record['cross_any_eos']=cross_eos
                 for selected in flat[-len(THRESHOLDS):]: selected['eos_excluded']=any_eos
                 all_rows.append(record);stream.write(json.dumps(record)+'\n');stream.flush()
                 print(json.dumps(dict(prompt=pi,round=round_index,accepted=base[0],
@@ -140,9 +176,15 @@ def main():
                 if has_eos(b16,base): break
             prompt_stats.append(dict(prompt_index=pi,blocks=round_index,generated_tokens=generated,ar_tail_steps=tail))
             print(f'完成 prompt {pi}/{len(prompts)}，累计 {len(all_rows)} blocks',flush=True)
+            if args.cross_k_repair:
+                (out/'cross_summary.json').write_text(json.dumps(summarize_cross(all_rows,THRESHOLDS),indent=2))
+                dump_csv(out/'cross_summary.csv',summarize_cross(all_rows,THRESHOLDS))
             (out/'summary.json').write_text(json.dumps(summarize(all_rows),indent=2))
     dump_csv(out/'summary.csv',summarize(all_rows));dump_csv(out/'selections.csv',flat);dump_csv(out/'prompt_stats.csv',prompt_stats)
     print(json.dumps(summarize(all_rows),indent=2),flush=True)
+    if args.cross_k_repair:
+        print('跨 K 实际修正统计：',flush=True)
+        print(json.dumps(summarize_cross(all_rows,THRESHOLDS),indent=2),flush=True)
     print(f'Results: {out}',flush=True)
 
 
