@@ -163,14 +163,14 @@ def export(rows,reference,out,positions=32):
         maximum=max(t['accepted'] for t in row['trials'].values())
         wide=[]
         table=[]
-        header='<tr><th class="position">Position</th><th class="target">Target AR<br>ID / probability</th>'
-        header+=''.join(f'<th>K{k}<br><small>accepted={row["trials"][str(k)]["accepted"]}</small></th>' for k in KS)+'</tr>'
+        header='<tr><th class="position">位置</th><th class="target">Target AR<br>编号 / 概率</th>'
+        header+=''.join(f'<th>K{k}<br><small>接受数={row["trials"][str(k)]["accepted"]}</small></th>' for k in KS)+'</tr>'
         for position in range(1,positions+1):
             target=refs.get(position)
             target_id=target['token_id'] if target else None
             target_prob=target['probability'] if target else None
             record=dict(position=position,target_id=target_id,target_probability=target_prob)
-            label=f'{target_id}<br><strong>{prob_text(target_prob)}</strong>' if target else '—<br><small>after EOS</small>'
+            label=f'{target_id}<br><strong>{prob_text(target_prob)}</strong>' if target else '—<br><small>EOS 之后</small>'
             cells=[f'<td class="position">{position}</td>',f'<td class="target">{label}</td>']
             previous=None
             for k in KS:
@@ -202,7 +202,7 @@ def export(rows,reference,out,positions=32):
             w=csv.DictWriter(f,fieldnames=list(wide[0]))
             w.writeheader()
             w.writerows(wide)
-        sections.append(f'<section><h2>{arm}-trained draft · observed A*={maximum}</h2>'
+        sections.append(f'<section><h2>{arm}-trained draft · 观测最大接受数 A*={maximum}</h2>'
             '<div class="scroll"><table><thead>'+header+'</thead><tbody>'+''.join(table)+'</tbody></table></div></section>')
     with (out/'top5_long.csv').open('w',newline='') as f:
         w=csv.DictWriter(f,fieldnames=list(all_long[0]))
@@ -210,7 +210,7 @@ def export(rows,reference,out,positions=32):
         w.writerows(all_long)
     first=next(iter(rows.values()))
     title=f"Top5 evolution · prompt {first['prompt_index']} · generated state {first['generated_position']}"
-    page='''<!doctype html><html lang="en"><meta charset="utf-8">
+    page='''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Top5 evolution</title>
 <style>
 body{font-family:system-ui,sans-serif;margin:24px;color:#172b40;background:#f6f8fb}h1{font-size:23px}h2{font-size:19px}
@@ -224,14 +224,55 @@ th.position,th.target{z-index:6}.missing{background:#f1f3f5;color:#8a95a1;text-a
 .verify{color:#174b88;border-bottom:1px dashed #aac1dc;margin-bottom:3px}
 .boundary td{border-top:2px solid #537ab0}section{margin-top:24px}small{font-weight:normal}
 </style><h1>'''+html.escape(title)+'''</h1>
-<p>Each K cell: T = target verification top1 ID / its own probability, followed by five draft ranks with token ID / probability.
-Probabilities use the full vocabulary (top5 probabilities are not renormalized).
-Green = matches the common target-AR token. Orange outline = top1 changed versus the preceding available K at this position.
-Gray = this position was not generated. Blue row border = observed A*+1 for this draft.</p>
-<p>The left Target AR column is one common autoregressive reference with its own probabilities. Each cell's T uses that K's
-draft-conditioned verification prefix and may differ after an earlier draft error. This is a position × K evolution matrix,
-not a Markov transition probability matrix.</p>'''
+<p>每个 K 单元格首先显示蓝色 T：target 在该 K 的 draft 前缀下验证得到的 top1 编号及概率；
+下方五行是 draft 的 top5 编号及概率。概率按完整词表计算，没有对 top5 重新归一化。
+绿色表示与左侧公共 Target AR 编号一致；橙色边框表示该位置的 draft top1 相比前一个可用 K 发生变化，
+不代表一定变好。灰色表示该 K 未生成此位置；蓝色行边界标记该模型观测到的 A*+1。</p>
+<p>左侧 Target AR 使用公共的自回归轨迹，显示 target 自身概率。每格的蓝色 T 使用各自的 draft 前缀，
+在较早位置出现错误后，可能与公共 AR 不同。A* 是所测试八个 K 中最大的实际接受数；
+这是一张“位置 × K”的预测变化表，不是马尔可夫转移概率矩阵。</p>'''
     (out/'matrix.html').write_text(page+''.join(sections)+'</html>')
+
+
+def select_samples(folder, count, state):
+    """First distinct prompts with both drafts at the same requested state."""
+    available={}
+    with (folder/'states.jsonl').open() as stream:
+        for line in stream:
+            if not line.strip(): continue
+            row=json.loads(line)
+            if row['generated_position']==state:
+                available.setdefault(row['prompt_index'],set()).add(row['arm'])
+    indices=sorted(i for i,arms in available.items() if {'fixed','mixed'}<=arms)
+    if len(indices)<count:
+        raise ValueError(f'Only {len(indices)} paired prompts at state {state}, requested {count}')
+    return indices[:count]
+
+
+def export_gallery(samples, out, metadata):
+    """Combine actual per-state reports; keep all numeric exports in subfolders."""
+    first_page=(samples[0][1]/'matrix.html').read_text()
+    head=first_page.split('<h1>',1)[0]
+    intro=first_page.split('</h1>',1)[1].split('<section>',1)[0]
+    parts=[head, '<h1>不同 K 下的预测变化：'+str(len(samples))+' 个样本</h1>',intro,
+        '<p>每个样本是一种固定上下文 KV 与 anchor 的组合。样本按 prompt 编号选取，'
+        '每个 prompt 只取指定的一个状态，不按结果好坏筛选。点击标题展开 fixed 和 mixed 两张表。</p>',
+        '<style>details{margin:18px 0;background:white;border:1px solid #cbd5df;border-radius:8px;padding:14px}'
+        'summary{cursor:pointer;font-weight:650;font-size:17px}.question{white-space:pre-wrap}</style>',
+        '<button onclick="document.querySelectorAll(\'details\').forEach(x=>x.open=true)">全部展开</button> '
+        '<button onclick="document.querySelectorAll(\'details\').forEach(x=>x.open=false)">全部折叠</button>']
+    manifest=[]
+    for n,(row,folder) in enumerate(samples,1):
+        page=(folder/'matrix.html').read_text()
+        tables='<section>'+page.split('<section>',1)[1].rsplit('</html>',1)[0]
+        prompt=next((p['prompt'] for p in metadata.get('prompts',[]) if p['prompt_key']==row['prompt_key']),[])
+        question='\n'.join(str(m.get('content','')) if isinstance(m,dict) else str(m) for m in prompt) if isinstance(prompt,list) else str(prompt)
+        parts.append(f'<details><summary>样本 {n} · prompt {row["prompt_index"]} · 已生成 {row["generated_position"]} token · 上下文 {row["context_length"]} token</summary>'
+            f'<p class="question">{html.escape(question)}</p>'+tables+'</details>')
+        manifest.append(dict(prompt_index=row['prompt_index'],generated_position=row['generated_position'],
+            prompt_key=row['prompt_key'],folder=folder.name))
+    (out/'matrix.html').write_text(''.join(parts)+'</html>')
+    (out/'samples.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
 
 
 def main():
@@ -240,6 +281,7 @@ def main():
     p.add_argument('--dataset',default='gsm8k')
     p.add_argument('--prompt-index',type=int,default=13)
     p.add_argument('--state',type=int,default=0)
+    p.add_argument('--samples',type=int,help='Export N distinct paired prompts at --state as collapsible Chinese HTML')
     p.add_argument('--arm',choices=['fixed','mixed','both'],default='both')
     p.add_argument('--positions',type=int,default=32)
     p.add_argument('--target',default='/home/jovyan/LMM/lmm_model/Qwen3-4B')
@@ -250,34 +292,43 @@ def main():
     root=Path(args.root)
     folder=root if (root/'states.jsonl').exists() else root/args.dataset
     metadata=json.loads((folder/'metadata.json').read_text())
-    rows=select_rows(folder,args.prompt_index,args.state,args.arm)
-    first=next(iter(rows.values()))
+    if args.samples is not None and (args.samples<1 or args.arm!='both' or args.target_reference):
+        p.error('--samples requires a positive count, --arm both, and no --target-reference')
+    indices=select_samples(folder,args.samples,args.state) if args.samples else [args.prompt_index]
     fingerprint=metadata['fingerprints']['target']
-    if args.target_reference:
-        reference=json.loads(Path(args.target_reference).read_text())
-    else:
+    if not args.target_reference:
         import torch
         from transformers import AutoModelForCausalLM,AutoTokenizer
         if not torch.cuda.is_available(): raise RuntimeError('Need one GPU to supplement target probabilities, or reuse --target-reference')
         torch.cuda.set_device(0)
         if model_identity(args.target)!=fingerprint: raise ValueError('Target weights differ from collection')
-        prompt=next(r['prompt'] for r in metadata['prompts'] if r['prompt_key']==first['prompt_key'])
         tokenizer=AutoTokenizer.from_pretrained(args.target)
-        text=tokenizer.apply_chat_template(prompt,tokenize=False,add_generation_prompt=True,enable_thinking=False)
-        ids=tokenizer.encode(text,add_special_tokens=False,return_tensors='pt').cuda()
         target=AutoModelForCausalLM.from_pretrained(args.target,torch_dtype=torch.bfloat16,
             attn_implementation='sdpa').cuda().eval().requires_grad_(False)
-        print('Reconstructing common target AR context and probabilities...',flush=True)
-        probabilities,prefix=reconstruct_reference(target,ids,args.state,tokenizer.eos_token_id,torch,first)
-        reference={field:first[field] for field in ('prompt_key','prefix_sha256','anchor_id','generated_position')}
-        reference.update(target_fingerprint=fingerprint,positions=probabilities,
-            verification_by_arm=verify_saved_blocks(target,prefix,rows,torch),
-            scope='common target AR next-candidate top1 and own full-softmax probability; excludes anchor')
-    validate_reference(reference,rows,fingerprint)
-    out=Path(args.output) if args.output else folder/(f'top5_matrix_prompt{args.prompt_index}_state{args.state}_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
-    export(rows,reference,out,args.positions)
-    print(f'Open: {out}/matrix.html')
-    print(f'CSV: {out}/matrix_fixed.csv and/or matrix_mixed.csv; long form: top5_long.csv')
+    out=Path(args.output) if args.output else folder/('top5_matrices_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+    if args.samples: out.mkdir(parents=True,exist_ok=False)
+    samples=[]
+    for number,index in enumerate(indices,1):
+        rows=select_rows(folder,index,args.state,args.arm)
+        first=next(iter(rows.values()))
+        if args.target_reference:
+            reference=json.loads(Path(args.target_reference).read_text())
+        else:
+            prompt=next(r['prompt'] for r in metadata['prompts'] if r['prompt_key']==first['prompt_key'])
+            text=tokenizer.apply_chat_template(prompt,tokenize=False,add_generation_prompt=True,enable_thinking=False)
+            ids=tokenizer.encode(text,add_special_tokens=False,return_tensors='pt').cuda()
+            print(f'样本 {number}/{len(indices)}：prompt={index}，state={args.state}，补充 target 概率...',flush=True)
+            probabilities,prefix=reconstruct_reference(target,ids,args.state,tokenizer.eos_token_id,torch,first)
+            reference={field:first[field] for field in ('prompt_key','prefix_sha256','anchor_id','generated_position')}
+            reference.update(target_fingerprint=fingerprint,positions=probabilities,
+                verification_by_arm=verify_saved_blocks(target,prefix,rows,torch),
+                scope='common target AR next-candidate top1 and own full-softmax probability; excludes anchor')
+        validate_reference(reference,rows,fingerprint)
+        destination=out/f'prompt{index}_state{args.state}' if args.samples else out
+        export(rows,reference,destination,args.positions)
+        samples.append((first,destination))
+    if args.samples: export_gallery(samples,out,metadata)
+    print(f'打开：{out}/matrix.html',flush=True)
 
 
 if __name__=='__main__':

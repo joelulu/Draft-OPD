@@ -59,3 +59,18 @@ small floating-point differences are possible even for a shared prefix.
 
 CPU tests: `python scripts/adaptive_length/test_top5_matrix.py`. The real-target
 test requires torch/transformers but uses tiny random weights, no downloads.
+
+## 十个样本的中文折叠报告
+
+```bash
+EVAL_GPU=7 bash scripts/adaptive_length/run_top5_matrix.sh \
+  --root runs/fixed_vs_dynamic_20261107_051744/logit_stability_20261108_155129 \
+  --dataset gsm8k --state 192 --samples 10 --arm both
+```
+
+按 prompt 编号选取在指定 state 同时保存 fixed/mixed 的前十条不同 prompt，
+不按接受长度或改善幅度筛选。每条 prompt 的一个 KV+anchor 状态算一个样本。
+若不足十条直接报错，不静默减少样本数。target 仅加载一次，
+每个样本单独校验上下文和验证 token，保留原始 CSV 与 target_reference.json。
+总览 `matrix.html` 包含十个可折叠样本、二十张表，以及中文介绍和图例。
+不重新训练或重新生成 draft。需要在已有原始数据和 target 权重的服务器运行。

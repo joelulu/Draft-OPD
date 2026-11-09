@@ -49,8 +49,35 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual(len(long),sum(min(k,12)*5 for k in exp.KS))
             page=(out/'matrix.html').read_text()
             self.assertIn('Target AR',page)
-            self.assertIn('after an earlier draft error',page)
+            self.assertIn('在较早位置出现错误后',page)
             self.assertIn('0.900000',page)
+
+    def test_ten_samples_two_tables_and_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            samples=[]
+            records=[]
+            for i in range(1,11):
+                mixed,ref=fixture()
+                mixed['prompt_index']=i
+                fixed=copy.deepcopy(mixed)
+                fixed['arm']='fixed'
+                ref['verification_by_arm']['fixed']=ref['verification_by_arm']['mixed']
+                folder=root/f'sample{i}'
+                exp.export({'fixed':fixed,'mixed':mixed},ref,folder,32)
+                samples.append((mixed,folder))
+                records.extend([mixed,fixed])
+            (root/'states.jsonl').write_text('\n'.join(json.dumps(r) for r in reversed(records)))
+            self.assertEqual(exp.select_samples(root,10,0),list(range(1,11)))
+            with self.assertRaises(ValueError): exp.select_samples(root,11,0)
+            exp.export_gallery(samples,root,{'prompts':[{'prompt_key':'p','prompt':[{'content':'<unsafe>'}]}]})
+            page=(root/'matrix.html').read_text()
+            self.assertEqual(page.count('<details>'),10)
+            self.assertEqual(page.count('<table>'),20)
+            self.assertIn('&lt;unsafe&gt;',page)
+            self.assertIn('全部折叠',page)
+            self.assertIn('lang="zh-CN"',page)
+            self.assertEqual(len(json.loads((root/'samples.json').read_text())),10)
 
     def test_reference_mismatch_is_rejected(self):
         row,ref=fixture()
